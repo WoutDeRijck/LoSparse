@@ -2,6 +2,7 @@ import torch
 import math
 import random
 from torch import nn
+import torch.nn.functional as F
 
 
 def low_rank_decomposition(weight, rank_ratio=0.1, parameter_ratio=0.15,
@@ -75,63 +76,51 @@ class LinearLoSparse(nn.Module):
         self.has_bias = has_bias
         self.has_sparse = has_sparse
 
+        # Initialize components
         self.right = nn.Linear(in_feature, reduced_rank, bias=False)
         self.left = nn.Linear(reduced_rank, out_feature, bias=False)
         if self.has_sparse:
             self.sparse = nn.Linear(in_feature, out_feature, bias=False)
+            # Initialize sparse weights to zero
+            nn.init.zeros_(self.sparse.weight)
 
+        # Initialize bias properly
         if self.has_bias:
-            self.bias = nn.Parameter(torch.zeros(out_feature, requires_grad=True))
+            self.bias = nn.Parameter(torch.zeros(out_feature))
+        else:
+            self.register_parameter('bias', None)
 
         self.nonzero_idx = None
         self.sparse_weight_pruned = None
         self.SX = None
-        self.SX_deberta = None    # Deberta will use Q and K again
+        self.SX_deberta = None
 
     def forward(self, x):
-        """Y = XW.T+B = X(LR+S).T+B = X(LR).T+XS.T+B"""
-        LRX = self.left(self.right(x))
+        batch_size = x.size(0)
+        
+        # Low rank component
+        LRX = self.left(self.right(x))  # Shape: [batch_size, out_feature]
+        
+        # Sparse component
         if self.has_sparse:
-            if self.sparse_weight_pruned is not None:
-                SX_ = torch.matmul(x, self.sparse_weight_pruned.T)
-                B, L, D = x.shape
-
-                # restore y
-                # keep record for the first forward
-                if self.SX is None or self.SX_deberta is None:  # For QKV at the first time
-                    out_feature, in_feature = self.sparse.weight.shape
-                    device = x.device
-                    if B != 1:
-                        self.SX = torch.zeros(B, L, out_feature, device=device)
-                        self.SX[..., self.nonzero_idx] = SX_
-                        Y = LRX + self.SX + self.bias if self.has_bias else LRX + self.SX
-                    else:   # For QK at the second time
-                        self.SX_deberta = torch.zeros(B, L, out_feature, device=device)
-                        self.SX_deberta[..., self.nonzero_idx] = SX_
-                        Y = LRX + self.SX_deberta + self.bias if self.has_bias else LRX + self.SX_deberta
-
-                # do not need to create new cuda memory
-                else:
-                    if B != 1:
-                        self.SX[..., self.nonzero_idx] = SX_
-                        Y = LRX + self.SX + self.bias if self.has_bias else LRX + self.SX
-                    else:
-                        self.SX_deberta[..., self.nonzero_idx] = SX_
-                        Y = LRX + self.SX_deberta + self.bias if self.has_bias else LRX + self.SX_deberta
-            else:
-                SX = self.sparse(x)
-                Y = LRX + SX + self.bias if self.has_bias else LRX + SX
+            SX = F.linear(x, self.sparse.weight, None)  # Shape: [batch_size, out_feature]
         else:
-            Y = LRX + self.bias if self.has_bias else LRX
-        return Y
+            # Create zero tensor with same shape as LRX
+            SX = torch.zeros_like(LRX, device=x.device)  # Shape: [batch_size, out_feature]
+        
+        # Add bias if present
+        if self.has_bias and self.bias is not None:
+            return LRX + SX + self.bias  # Bias will be automatically broadcasted
+        return LRX + SX
 
     def initialize_weight(self, left_weight, right_weight, sparse_weight=None, bias=None):
-        self.left.weight = nn.Parameter(left_weight, requires_grad=True)
-        self.right.weight = nn.Parameter(right_weight, requires_grad=True)
-        if self.has_sparse:
-            self.sparse.weight = nn.Parameter(sparse_weight, requires_grad=True)
-        if self.has_bias:
-            self.bias = nn.Parameter(bias, requires_grad=True)
+        """Initialize weights from pre-trained values"""
+        self.left.weight = nn.Parameter(left_weight)
+        self.right.weight = nn.Parameter(right_weight)
+        if self.has_sparse and sparse_weight is not None:
+            self.sparse.weight = nn.Parameter(sparse_weight)
+        if self.has_bias and bias is not None:
+            self.bias = nn.Parameter(bias)
 
     def prune_sparse(self):
         self.nonzero_idx = torch.nonzero(self.sparse.weight.sum(dim=1)).flatten()
