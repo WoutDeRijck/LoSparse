@@ -338,8 +338,8 @@ def main():
     ##################################
 
     # Substitute weights with low rank matrix and sparse matrix
-    allow_name = ['query', 'key', 'value', 'q_proj', 'k_proj', 'v_proj', 'query_proj', 'key_proj', 'value_proj', 'out_proj', 'dense', 'attention', 'fc1', 'fc2']
-    block_name = ['pooler', 'classifier', 'LayerNorm', 'embeddings']
+    allow_name = ['Wqkv', 'Wo', 'Wi', 'dense']  # Core weight matrices to be decomposed
+    block_name = ['embeddings', 'norm', 'head', 'classifier', 'final_norm']  # Layers to skip/block from decomposition
 
     utils.substitute_layer_weights(module=model,
                                    allow_name=allow_name,
