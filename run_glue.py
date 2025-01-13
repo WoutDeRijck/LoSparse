@@ -89,7 +89,7 @@ def parse_args():
     parser.add_argument("--beta1", type=float, default=0.85)
     parser.add_argument("--beta2", type=float, default=1.)
     parser.add_argument("--deltaT", type=int, default=10)
-    parser.add_argument("--eval_checkpoint", type=str, default="No checkpoint")
+    parser.add_argument("--eval_checkpoint", type=str, default=None, help="Directory containing model checkpoint for evaluation")
     parser.add_argument("--max_train_samples", type=int, default=None, help="For debugging purposes or quicker training, truncate the number of training examples to this value if set.")
     parser.add_argument("--max_eval_samples", type=int, default=None, help="For debugging purposes or quicker evaluation, truncate the number of evaluation examples to this value if set.")
     args = parser.parse_args()
@@ -180,30 +180,34 @@ def main():
 
     config = AutoConfig.from_pretrained(args.model_name_or_path, num_labels=num_labels, finetuning_task=args.task_name)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=not args.use_slow_tokenizer)
-    model = AutoModelForSequenceClassification.from_pretrained(
-        args.model_name_or_path,
-        from_tf=bool(".ckpt" in args.model_name_or_path),
-        config=config,
-    )
+    
+    # Load or create model based on whether we're evaluating
+    if args.eval_checkpoint is not None:
+        logger.info(f"Loading checkpoint from {args.eval_checkpoint} for evaluation")
+        model = AutoModelForSequenceClassification.from_pretrained(
+            args.eval_checkpoint,
+            num_labels=num_labels,
+            finetuning_task=args.task_name
+        )
+    else:
+        model = AutoModelForSequenceClassification.from_pretrained(
+            args.model_name_or_path,
+            from_tf=bool(".ckpt" in args.model_name_or_path),
+            config=config,
+        )
+        # Apply model modifications only for training
+        allow_name = ['Wqkv', 'Wo', 'Wi', 'dense']
+        block_name = ['embeddings', 'norm', 'head', 'classifier', 'final_norm']
 
-    allow_name = ['Wqkv', 'Wo', 'Wi', 'dense']
-    block_name = ['embeddings', 'norm', 'head', 'classifier', 'final_norm']
-
-    utils.substitute_layer_weights(
-        module=model,
-        allow_name=allow_name,
-        block_name=block_name,
-        parameter_ratio=args.low_rank_parameter_ratio,
-        do_svd=True
-    )
+        utils.substitute_layer_weights(
+            module=model,
+            allow_name=allow_name,
+            block_name=block_name,
+            parameter_ratio=args.low_rank_parameter_ratio,
+            do_svd=True
+        )
 
     model.resize_token_embeddings(len(tokenizer))
-    if args.eval_checkpoint != "No checkpoint":
-        print(model.load_state_dict(
-            torch.load(args.eval_checkpoint, map_location=accelerator.device),
-            strict=False))
-    else:
-        print("Not doing eval")
 
     if args.task_name is not None:
         sentence1_key, sentence2_key = task_to_keys[args.task_name]
@@ -255,8 +259,9 @@ def main():
         result = tokenizer(*texts, padding=padding, max_length=args.max_length, truncation=True)
 
         if "label" in examples:
-            if label_to_id is not None:
-                result["labels"] = [label_to_id[l] for l in examples["label"]]
+            if not is_regression:
+                # Use model's label mapping
+                result["labels"] = examples["label"]
             else:
                 result["labels"] = examples["label"]
         return result
@@ -344,12 +349,27 @@ def main():
         pruner_name='PLATON'
     )
 
+    # If we're only evaluating
+    if args.eval_checkpoint is not None:
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            eval_dataset=eval_dataset,
+            processing_class=tokenizer,
+            data_collator=data_collator,
+            compute_metrics=compute_metrics,
+        )
+        metrics = trainer.evaluate()
+        logger.info(f"Evaluation metrics: {metrics}")
+        return
+    
+    # Regular training path
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
         data_collator=data_collator,
         compute_metrics=compute_metrics,
         callbacks=[PruningCallback(pruner)],
@@ -358,7 +378,8 @@ def main():
     trainer.train()
     
     # Save the final model
-    trainer.save_model(args.output_dir)
+    if args.output_dir is not None:
+        trainer.save_model(args.output_dir)
     
     if args.push_to_hub:
         trainer.push_to_hub()
