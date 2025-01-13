@@ -1,10 +1,31 @@
-.idea/*
+# Byte-compiled files
+__pycache__/
+*.py[cod]
 
-# 
+# Distribution / packaging
+.Python
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+*.egg-info/
+.dist-info/
+*.egg
 
-__pyche__
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
 
-# MacOS
+# macOS
 .DS_Store
 
-__pycache__
+# IDEs and editors
+.idea/
+.vscode/
+*.swp
+
+# Virtual environments
+.venv/
+
+output/

@@ -2,6 +2,7 @@ import torch
 import math
 import random
 from torch import nn
+import torch.nn.functional as F
 
 
 def low_rank_decomposition(weight, rank_ratio=0.1, parameter_ratio=0.15,
@@ -75,63 +76,64 @@ class LinearLoSparse(nn.Module):
         self.has_bias = has_bias
         self.has_sparse = has_sparse
 
+        # Initialize components
         self.right = nn.Linear(in_feature, reduced_rank, bias=False)
         self.left = nn.Linear(reduced_rank, out_feature, bias=False)
         if self.has_sparse:
             self.sparse = nn.Linear(in_feature, out_feature, bias=False)
+            # Initialize sparse weights to zero
+            nn.init.zeros_(self.sparse.weight)
 
+        # Initialize bias properly
         if self.has_bias:
-            self.bias = nn.Parameter(torch.zeros(out_feature, requires_grad=True))
+            self.bias = nn.Parameter(torch.zeros(out_feature))
+        else:
+            self.register_parameter('bias', None)
 
         self.nonzero_idx = None
         self.sparse_weight_pruned = None
         self.SX = None
-        self.SX_deberta = None    # Deberta will use Q and K again
+        self.SX_deberta = None
 
     def forward(self, x):
-        """Y = XW.T+B = X(LR+S).T+B = X(LR).T+XS.T+B"""
-        LRX = self.left(self.right(x))
+        batch_size = x.size(0)
+        
+        # Low rank component
+        LRX = self.left(self.right(x))  # Shape: [batch_size, out_feature]
+        
+        # Sparse component with pruning optimization
         if self.has_sparse:
             if self.sparse_weight_pruned is not None:
+                # Efficient computation using only non-zero weights
                 SX_ = torch.matmul(x, self.sparse_weight_pruned.T)
-                B, L, D = x.shape
-
-                # restore y
-                # keep record for the first forward
-                if self.SX is None or self.SX_deberta is None:  # For QKV at the first time
+                
+                # Restore full dimension output
+                if self.SX is None:
+                    B, L, D = x.shape
                     out_feature, in_feature = self.sparse.weight.shape
-                    device = x.device
-                    if B != 1:
-                        self.SX = torch.zeros(B, L, out_feature, device=device)
-                        self.SX[..., self.nonzero_idx] = SX_
-                        Y = LRX + self.SX + self.bias if self.has_bias else LRX + self.SX
-                    else:   # For QK at the second time
-                        self.SX_deberta = torch.zeros(B, L, out_feature, device=device)
-                        self.SX_deberta[..., self.nonzero_idx] = SX_
-                        Y = LRX + self.SX_deberta + self.bias if self.has_bias else LRX + self.SX_deberta
-
-                # do not need to create new cuda memory
-                else:
-                    if B != 1:
-                        self.SX[..., self.nonzero_idx] = SX_
-                        Y = LRX + self.SX + self.bias if self.has_bias else LRX + self.SX
-                    else:
-                        self.SX_deberta[..., self.nonzero_idx] = SX_
-                        Y = LRX + self.SX_deberta + self.bias if self.has_bias else LRX + self.SX_deberta
+                    self.SX = torch.zeros(B, L, out_feature, device=x.device)
+                
+                # Update only non-zero indices
+                self.SX[..., self.nonzero_idx] = SX_
+                SX = self.SX
             else:
-                SX = self.sparse(x)
-                Y = LRX + SX + self.bias if self.has_bias else LRX + SX
+                SX = F.linear(x, self.sparse.weight, None)
         else:
-            Y = LRX + self.bias if self.has_bias else LRX
-        return Y
+            SX = torch.zeros_like(LRX, device=x.device)
+        
+        # Add bias if present
+        if self.has_bias and self.bias is not None:
+            return LRX + SX + self.bias
+        return LRX + SX
 
     def initialize_weight(self, left_weight, right_weight, sparse_weight=None, bias=None):
-        self.left.weight = nn.Parameter(left_weight, requires_grad=True)
-        self.right.weight = nn.Parameter(right_weight, requires_grad=True)
-        if self.has_sparse:
-            self.sparse.weight = nn.Parameter(sparse_weight, requires_grad=True)
-        if self.has_bias:
-            self.bias = nn.Parameter(bias, requires_grad=True)
+        """Initialize weights from pre-trained values"""
+        self.left.weight = nn.Parameter(left_weight)
+        self.right.weight = nn.Parameter(right_weight)
+        if self.has_sparse and sparse_weight is not None:
+            self.sparse.weight = nn.Parameter(sparse_weight)
+        if self.has_bias and bias is not None:
+            self.bias = nn.Parameter(bias)
 
     def prune_sparse(self):
         self.nonzero_idx = torch.nonzero(self.sparse.weight.sum(dim=1)).flatten()
@@ -330,59 +332,94 @@ class Pruner(object):
         # Calculate the sensitivity and uncertainty
         for n, p in model.named_parameters():
             if self.whether_mask_para(n):
+                # Skip if no gradient
+                if p.grad is None:
+                    continue
+                    
+                # Initialize if not exists
                 if n not in self.exp_avg_ipt:
                     self.exp_avg_ipt[n] = torch.zeros_like(p)
-                    self.ipt[n] = torch.zeros_like(p)
+                    # Initialize with current importance instead of zeros
+                    self.ipt[n] = (p * p.grad).abs().detach()
                     if self.beta2 > 0 and self.beta2 != 1:
                         self.exp_avg_unc[n] = torch.zeros_like(p)
-                if self.pruner_name == 'Magnitude':
-                    # Calculate the score of magnitude pruning
-                    self.ipt[n] = p.abs().detach()
-                elif self.pruner_name == 'PLATON':
+                
+                # PLATON importance calculation
+                if self.pruner_name == 'PLATON':
                     local_step = global_step % self.deltaT
                     update_step = global_step // self.deltaT
+                    
+                    # Calculate new importance
+                    new_ipt = (p * p.grad).abs().detach()
+                    
                     if local_step == 0:
+                        # Update exponential moving average
                         self.exp_avg_ipt[n] = self.beta1 * self.exp_avg_ipt[n] + (1 - self.beta1) * self.ipt[n]
+                        
+                        # Update uncertainty estimate
                         if 0 < self.beta2 < 1:
                             self.exp_avg_unc[n] = self.beta2 * self.exp_avg_unc[n] + \
-                                                  (1 - self.beta2) * (self.ipt[n] - self.exp_avg_ipt[n]).abs()
+                                                (1 - self.beta2) * (self.ipt[n] - self.exp_avg_ipt[n]).abs()
                         elif self.beta2 == 2.:
                             self.exp_avg_unc[n] = (update_step * self.exp_avg_unc[n] +
-                                                   (self.ipt[n] - self.exp_avg_ipt[n]) ** 2) / (update_step + 1)
-                        self.ipt[n] = (p * p.grad).abs().detach()
+                                                 (self.ipt[n] - self.exp_avg_ipt[n]) ** 2) / (update_step + 1)
+                        
+                        # Reset importance accumulator
+                        self.ipt[n] = new_ipt
                     else:
-                        self.ipt[n] = (self.ipt[n] * local_step + (p * p.grad).abs().detach()) / (local_step + 1)
+                        # Accumulate importance with moving average
+                        self.ipt[n] = (self.ipt[n] * local_step + new_ipt) / (local_step + 1)
                 else:
                     raise ValueError("Incorrect Pruner Name.")
 
     def mask_with_threshold(self, model, threshold):
-        # Calculate the final importance score
+        # Initialize importance score dictionary
         is_dict = {}
+        
+        # Calculate importance scores
         for n, p in model.named_parameters():
             if self.whether_mask_para(n):
                 if self.pruner_name == 'Magnitude':
-                    is_dict[n] = self.ipt[n]
+                    is_dict[n] = p.abs().detach()
                 elif self.pruner_name == 'PLATON':
+                    # Skip if no importance scores
+                    if n not in self.exp_avg_ipt:
+                        continue
+                    
+                    # Use current importance scores directly
                     if 0 < self.beta2 < 1:
-                        is_dict[n] = self.exp_avg_ipt[n] * self.exp_avg_unc[n]
+                        is_dict[n] = self.ipt[n] * self.exp_avg_unc[n]  # Use current importance instead of exp_avg_ipt
                     elif self.beta2 == 1.:
-                        is_dict[n] = self.exp_avg_ipt[n]
+                        is_dict[n] = self.ipt[n]  # Use current importance directly
                     elif self.beta2 == 2.:
-                        is_dict[n] = self.exp_avg_ipt[n] * self.exp_avg_unc.sqrt()
+                        is_dict[n] = self.ipt[n] * self.exp_avg_unc[n].sqrt()
                     else:
-                        # Handling the unaccepted beta2 to default setting
-                        is_dict[n] = self.exp_avg_ipt[n] * (self.ipt[n] - self.exp_avg_ipt[n]).abs()
-                else:
-                    raise ValueError("Incorrect Pruner Name.")
+                        is_dict[n] = self.ipt[n] * (self.ipt[n] - self.exp_avg_ipt[n]).abs()
+
                 if self.structured_method is not None and len(is_dict[n].shape) == 2:
                     is_dict[n] = self.structured_prune(is_dict[n], n)
-        # Calculate the mask threshold
-        all_is = torch.cat([is_dict[n].view(-1) for n in is_dict])
+
+        # Calculate statistics and threshold
+        all_is = []
+        for n, is_score in is_dict.items():
+            all_is.append(is_score.view(-1))
+        
+        all_is = torch.cat(all_is)
         mask_threshold = torch.kthvalue(all_is, int(all_is.shape[0] * (1 - threshold)))[0].item()
+        
         # Mask weights whose importance lower than threshold
+        total_weights = 0
+        total_pruned = 0
         for n, p in model.named_parameters():
             if self.whether_mask_para(n):
-                p.data.masked_fill_(is_dict[n] < mask_threshold, 0.0)
+                num_zeros_before = (p.data == 0).sum().item()
+                mask = is_dict[n] < mask_threshold
+                p.data.masked_fill_(mask, 0.0)
+                num_zeros_after = (p.data == 0).sum().item()
+                pruned = num_zeros_after - num_zeros_before
+                total_pruned += pruned
+                total_weights += p.numel()
+        
         return mask_threshold
 
     def update_and_pruning(self, model, global_step):
