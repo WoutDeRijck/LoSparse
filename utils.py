@@ -68,52 +68,59 @@ def low_rank_decomposition(weight, rank_ratio=0.1, parameter_ratio=0.15,
 
 
 class LinearLoSparse(nn.Module):
-    def __init__(self, in_feature, out_feature, reduced_rank, has_bias=True, has_sparse=True):
+    def __init__(self, in_feature, out_feature, initial_rank, has_bias=True, has_sparse=True):
         super().__init__()
         self.in_feature = in_feature
         self.out_feature = out_feature
-        self.reduced_rank = reduced_rank
+        self.current_rank = initial_rank
         self.has_bias = has_bias
         self.has_sparse = has_sparse
 
-        # Initialize components
-        self.right = nn.Linear(in_feature, reduced_rank, bias=False)
-        self.left = nn.Linear(reduced_rank, out_feature, bias=False)
+        # Initialize components with buffers for importance scores
+        self.right = nn.Linear(in_feature, initial_rank, bias=False)
+        self.left = nn.Linear(initial_rank, out_feature, bias=False)
+        self.register_buffer('rank_importance', torch.zeros(initial_rank))
+        
+        # Register hooks for gradient-based importance update
+        self.right.weight.register_hook(self._gradient_hook)
+        
         if self.has_sparse:
             self.sparse = nn.Linear(in_feature, out_feature, bias=False)
-            # Initialize sparse weights to zero
             nn.init.zeros_(self.sparse.weight)
 
-        # Initialize bias properly
         if self.has_bias:
             self.bias = nn.Parameter(torch.zeros(out_feature))
         else:
             self.register_parameter('bias', None)
 
-        self.nonzero_idx = None
-        self.sparse_weight_pruned = None
-        self.SX = None
-        self.SX_deberta = None
+    def _gradient_hook(self, grad):
+        """Hook to update importance scores when gradients are computed"""
+        if self.training:
+            with torch.no_grad():
+                right_imp = torch.sum(torch.abs(grad * self.right.weight), dim=1)
+                left_imp = torch.sum(torch.abs(self.left.weight.grad * self.left.weight), dim=0)
+                
+                # Combine importance scores
+                combined_imp = (right_imp * left_imp).detach()
+                
+                # Update moving average of importance scores
+                beta = 0.9  # Exponential moving average factor
+                self.rank_importance.mul_(beta).add_((1 - beta) * combined_imp)
+        return grad
 
     def forward(self, x):
-        batch_size = x.size(0)
-        
         # Low rank component
-        LRX = self.left(self.right(x))  # Shape: [batch_size, out_feature]
+        right_out = self.right(x)
+        LRX = self.left(right_out)
         
         # Sparse component with pruning optimization
         if self.has_sparse:
-            if self.sparse_weight_pruned is not None:
-                # Efficient computation using only non-zero weights
+            if hasattr(self, 'sparse_weight_pruned') and self.sparse_weight_pruned is not None:
                 SX_ = torch.matmul(x, self.sparse_weight_pruned.T)
-                
-                # Restore full dimension output
-                if self.SX is None:
+                if not hasattr(self, 'SX') or self.SX is None:
                     B, L, D = x.shape
                     out_feature, in_feature = self.sparse.weight.shape
                     self.SX = torch.zeros(B, L, out_feature, device=x.device)
-                
-                # Update only non-zero indices
                 self.SX[..., self.nonzero_idx] = SX_
                 SX = self.SX
             else:
@@ -422,13 +429,43 @@ class Pruner(object):
         
         return mask_threshold
 
+    def update_ranks(self, model, global_step):
+        """Dynamically adjust ranks based on importance scores"""
+        if global_step % self.deltaT != 0:
+            return
+        
+        for name, module in model.named_modules():
+            if isinstance(module, LinearLoSparse):
+                # Calculate target rank based on importance distribution
+                importance_scores = module.rank_importance
+                total_params = module.in_feature * module.out_feature
+                
+                # Use relative importance to determine new rank
+                sorted_imp, _ = torch.sort(importance_scores, descending=True)
+                cumsum_imp = torch.cumsum(sorted_imp, 0) / torch.sum(sorted_imp)
+                
+                # Find minimum rank that captures 95% of importance
+                target_rank = torch.sum(cumsum_imp < 0.95).item() + 1
+                
+                # Constrain rank changes
+                max_rank = min(module.in_feature, module.out_feature)
+                min_rank = max(1, int(0.01 * max_rank))  # At least 1% of max possible rank
+                target_rank = min(max(target_rank, min_rank), max_rank)
+                
+                # Adjust rank if change is significant (>10%)
+                if abs(target_rank - module.current_rank) / module.current_rank > 0.1:
+                    module.adjust_rank(target_rank)
+
     def update_and_pruning(self, model, global_step):
-        # Update importance score after optimizer stepping
+        # Update importance scores
         self.update_ipt_with_local_window(model, global_step)
-        # Get the remaining ratio
+        
+        # Update ranks based on importance
+        self.update_ranks(model, global_step)
+        
+        # Continue with existing pruning logic
         threshold, mask_ind = self.schedule_threshold_comb(global_step)
         if mask_ind:
-            # Mask weights during masking horizon
             mask_threshold = self.mask_with_threshold(model, threshold)
         else:
             mask_threshold = None
