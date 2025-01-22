@@ -207,6 +207,16 @@ def main():
             do_svd=True
         )
 
+        utils.substitute_embedding_layer(model, parameter_ratio=0.1)
+
+        # Print parameter counts per layer
+        for name, module in model.named_modules():
+            num_params = sum(p.numel() for p in module.parameters())
+            if num_params > 0:  # Only print layers with parameters
+                logger.info(f"Layer {name}: {num_params:,} parameters")
+    
+    
+
     model.resize_token_embeddings(len(tokenizer))
 
     if args.task_name is not None:

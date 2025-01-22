@@ -4,6 +4,8 @@ import random
 from torch import nn
 import torch.nn.functional as F
 
+from pss import ParameterSharedEmbedding
+
 
 def low_rank_decomposition(weight, rank_ratio=0.1, parameter_ratio=0.15,
                            remove_criteria='max_eigenvalue',
@@ -433,4 +435,32 @@ class Pruner(object):
         else:
             mask_threshold = None
         return threshold, mask_threshold
+
+
+def substitute_embedding_layer(model, parameter_ratio=0.1):
+    """Replace token embedding layer with PSS embedding"""
+    print("Converting token embedding layer to PSS")
+    
+    # Get original embedding layer
+    orig_embedding = model.embeddings.tok_embeddings
+    
+    # Calculate epsilon based on parameter ratio
+    # parameter_ratio = k*d / (n*d) = k/n
+    epsilon = math.sqrt(1 / (parameter_ratio * orig_embedding.num_embeddings))
+    
+    # Create PSS embedding layer
+    pss_embedding = ParameterSharedEmbedding(
+        num_embeddings=orig_embedding.num_embeddings,
+        embedding_dim=orig_embedding.embedding_dim,
+        epsilon=epsilon,
+        device=orig_embedding.weight.device
+    )
+    
+    # Initialize from pretrained embeddings
+    pss_embedding.from_pretrained(orig_embedding.weight)
+    
+    # Replace the token embeddings using setattr
+    setattr(model.embeddings, 'tok_embeddings', pss_embedding)
+    
+    print(f"Token embedding layer converted to PSS with epsilon={epsilon:.4f}")
 
