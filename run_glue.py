@@ -92,6 +92,7 @@ def parse_args():
     parser.add_argument("--eval_checkpoint", type=str, default=None, help="Directory containing model checkpoint for evaluation")
     parser.add_argument("--max_train_samples", type=int, default=None, help="For debugging purposes or quicker training, truncate the number of training examples to this value if set.")
     parser.add_argument("--max_eval_samples", type=int, default=None, help="For debugging purposes or quicker evaluation, truncate the number of evaluation examples to this value if set.")
+    parser.add_argument("--eval_steps", type=int, default=50, help="Number of steps between evaluations.")
     args = parser.parse_args()
 
     if args.task_name is None and args.train_file is None and args.validation_file is None:
@@ -295,7 +296,7 @@ def main():
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         evaluation_strategy="steps",
-        eval_steps=50,
+        eval_steps=args.eval_steps,
         learning_rate=args.learning_rate,
         per_device_train_batch_size=args.per_device_train_batch_size,
         per_device_eval_batch_size=args.per_device_eval_batch_size,
