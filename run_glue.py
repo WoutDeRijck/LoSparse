@@ -152,35 +152,25 @@ def main():
             os.makedirs(args.output_dir, exist_ok=True)
     accelerator.wait_for_everyone()
 
-    if args.task_name is not None:
-        raw_datasets = load_dataset("glue", args.task_name)
+    # Get the datasets
+    raw_datasets = load_dataset("glue", args.task_name)
+    is_regression = args.task_name == "stsb"
+    if not is_regression:
+        label_list = raw_datasets["train"].features["label"].names
+        num_labels = len(label_list)
     else:
-        data_files = {}
-        if args.train_file is not None:
-            data_files["train"] = args.train_file
-        if args.validation_file is not None:
-            data_files["validation"] = args.validation_file
-        extension = (args.train_file if args.train_file is not None else args.validation_file).split(".")[-1]
-        raw_datasets = load_dataset(extension, data_files=data_files)
-
-    if args.task_name is not None:
-        is_regression = args.task_name == "stsb"
-        if not is_regression:
-            label_list = raw_datasets["train"].features["label"].names
-            num_labels = len(label_list)
-        else:
-            num_labels = 1
-    else:
-        is_regression = raw_datasets["train"].features["label"].dtype in ["float32", "float64"]
-        if is_regression:
-            num_labels = 1
-        else:
-            label_list = raw_datasets["train"].unique("label")
-            label_list.sort()
-            num_labels = len(label_list)
+        num_labels = 1
 
     config = AutoConfig.from_pretrained(args.model_name_or_path, num_labels=num_labels, finetuning_task=args.task_name)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=not args.use_slow_tokenizer)
+    
+    # Calculate padding for optimal tensor core usage (multiple of 8)
+    vocab_size = len(tokenizer)
+    padding_size = (8 - (vocab_size % 8)) % 8
+    if padding_size > 0:
+        vocab_size_padded = vocab_size + padding_size
+        logger.info(f"Padding vocabulary size from {vocab_size} to {vocab_size_padded} for optimal Tensor Core usage")
+        config.vocab_size = vocab_size_padded
     
     # Load or create model based on whether we're evaluating
     if args.eval_checkpoint is not None:
@@ -188,7 +178,8 @@ def main():
         model = AutoModelForSequenceClassification.from_pretrained(
             args.eval_checkpoint,
             num_labels=num_labels,
-            finetuning_task=args.task_name
+            finetuning_task=args.task_name,
+            config=config
         )
     else:
         model = AutoModelForSequenceClassification.from_pretrained(
@@ -210,17 +201,7 @@ def main():
 
     model.resize_token_embeddings(len(tokenizer))
 
-    if args.task_name is not None:
-        sentence1_key, sentence2_key = task_to_keys[args.task_name]
-    else:
-        non_label_column_names = [name for name in raw_datasets["train"].column_names if name != "label"]
-        if "sentence1" in non_label_column_names and "sentence2" in non_label_column_names:
-            sentence1_key, sentence2_key = "sentence1", "sentence2"
-        else:
-            if len(non_label_column_names) >= 2:
-                sentence1_key, sentence2_key = non_label_column_names[:2]
-            else:
-                sentence1_key, sentence2_key = non_label_column_names[0], None
+    sentence1_key, sentence2_key = task_to_keys[args.task_name]
 
     label_to_id = None
     if (
@@ -258,10 +239,8 @@ def main():
             (examples[sentence1_key],) if sentence2_key is None else (examples[sentence1_key], examples[sentence2_key])
         )
         result = tokenizer(*texts, padding=padding, max_length=args.max_length, truncation=True)
-
         if "label" in examples:
             if not is_regression:
-                # Use model's label mapping
                 result["labels"] = examples["label"]
             else:
                 result["labels"] = examples["label"]
@@ -290,7 +269,7 @@ def main():
 
     data_collator = DataCollatorWithPadding(
         tokenizer, 
-        pad_to_multiple_of=(8 if args.fp16 else None)
+        pad_to_multiple_of=8  # Always pad to multiple of 8 for tensor cores
     )
 
     training_args = TrainingArguments(
@@ -311,36 +290,92 @@ def main():
         push_to_hub=args.push_to_hub,
         hub_model_id=args.hub_model_id,
         hub_token=args.hub_token,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        gradient_accumulation_steps=args.gradient_accumulation_steps
     )
 
     metric = evaluate.load("accuracy")
     def compute_metrics(eval_pred):
         predictions, labels = eval_pred
-        predictions = np.argmax(predictions, axis=1)
+        predictions = np.argmax(predictions, axis=1) if not is_regression else predictions[:, 0]
         return metric.compute(predictions=predictions, references=labels)
 
     class PruningCallback(TrainerCallback):
         def __init__(self, pruner):
-            self.pruner = pruner
+            self.pruner: utils.Pruner = pruner
             self.step = 0
             self.logger = get_logger(__name__)
+
+        def count_zero_params(self, model):
+            total_params = 0
+            zero_params = 0
+            for name, param in model.named_parameters():
+                if 'sparse' in name:  # Only count parameters that can be pruned
+                    param_count = param.numel()
+                    zero_count = (param == 0).sum().item()
+                    total_params += param_count
+                    zero_params += zero_count
+            return total_params, zero_params
+
+        def on_init_end(self, args, state, control, **kwargs):
+            # Count initial zero parameters
+            total_params, zero_params = self.count_zero_params(kwargs['model'])
+            self.logger.info(f"Initial prunable parameters: {total_params}")
+            self.logger.info(f"Initial zero parameters: {zero_params} ({100 * zero_params / total_params:.2f}%)")
+            return control
 
         def on_optimizer_step(self, args, state, control, **kwargs):
             self.step += 1
             if self.step % args.gradient_accumulation_steps == 0:
                 model = kwargs['model']
-                threshold, mask_threshold = self.pruner.update_and_pruning(model, state.global_step)
+                threshold, mask_threshold = self.pruner.update_and_pruning(model, state.global_step + 1)
+
+                if mask_threshold is not None:
+                    self.logger.info(f"Step {state.global_step + 1}: Gradual pruning phase - Applying pruning with threshold {threshold:.4f}")
+                else:
+                    self.logger.info(f"Step {state.global_step + 1}: Gradual pruning phase - No pruning this step (deltaT={self.pruner.deltaT})")
+                # Count and log zero parameters after pruning
+                total_params, zero_params = self.count_zero_params(model)
+                self.logger.info(f"Step {state.global_step + 1}: Zero parameters: {zero_params}/{total_params} ({100 * zero_params / total_params:.2f}%)")
 
         def on_evaluate(self, args, state, control, metrics=None, **kwargs):
-            if metrics is not None and 'eval_accuracy' in metrics:
-                self.logger.info(f"epoch {state.epoch:.0f}: {{'accuracy': {metrics['eval_accuracy']}}}")
+            """Called during evaluation"""
+            model = kwargs['model']
+            
+            # Count zero parameters before evaluation
+            total_params, zero_params = self.count_zero_params(model)
+            self.logger.info(f"\nPre-evaluation state at epoch {state.epoch:.0f}:")
+            self.logger.info(f"Zero parameters: {zero_params}/{total_params} ({100 * zero_params / total_params:.2f}%)")
+            
+            if metrics is not None:
+                self.logger.info(f"Evaluation metrics: {metrics}")
+
+        def on_train_end(self, args, state, control, **kwargs):
+            """Called at the end of training"""
+            model = kwargs['model']
+            
+            # Count and log final zero parameters
+            total_params, zero_params = self.count_zero_params(model)
+            self.logger.info("\n=== Final Model Statistics ===")
+            self.logger.info(f"Total parameters: {total_params}")
+            self.logger.info(f"Zero parameters: {zero_params}")
+            self.logger.info(f"Pruning ratio: {100 * zero_params / total_params:.2f}%")
+            return control
 
     # Calculate max_train_steps if not provided
     if args.max_train_steps is None:
         num_update_steps_per_epoch = math.ceil(len(train_dataset) / (args.per_device_train_batch_size * args.gradient_accumulation_steps))
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
         print(f"Total training steps: {args.max_train_steps}")
+
+    logger.info(f"Total training steps: {args.max_train_steps}")
+    logger.info(f"Steps per epoch: {num_update_steps_per_epoch}")
+    logger.info(f"Warmup steps: {args.warmup_steps}")
+    logger.info(f"Initial warmup period: {args.initial_warmup * args.warmup_steps} steps")
+    logger.info(f"Final warmup period: {args.final_warmup * args.warmup_steps} steps")
+    logger.info("Pruning schedule:")
+    logger.info(f"- No pruning: steps 0-{args.initial_warmup * args.warmup_steps}")
+    logger.info(f"- Gradual pruning: steps {args.initial_warmup * args.warmup_steps + 1}-{args.max_train_steps - args.final_warmup * args.warmup_steps}")
+    logger.info(f"- Final pruning: steps {args.max_train_steps - args.final_warmup * args.warmup_steps + 1}-{args.max_train_steps}")
 
     pruner = utils.Pruner(
         model=model,

@@ -247,6 +247,7 @@ class Pruner(object):
         self.deltaT = self.config["deltaT"]
         self.structured_method = structured_method
         self.structured_direction = structured_direction
+        self.current_threshold = 1.0  # Initialize with no pruning
 
     def whether_mask_para(self, n):
         if not self.use_no_mask:
@@ -313,19 +314,20 @@ class Pruner(object):
         initial_warmup = self.config['initial_warmup']
         final_warmup = self.config['final_warmup']
         warmup_steps = self.config['warmup_steps']
-        mask_ind = False
+
         if step <= initial_warmup * warmup_steps:
             threshold = initial_threshold
-            mask_ind = False
         elif step > (total_step - final_warmup * warmup_steps):
             threshold = final_threshold
-            mask_ind = True
         else:
             spars_warmup_steps = initial_warmup * warmup_steps
             spars_schedu_steps = (final_warmup + initial_warmup) * warmup_steps
             mul_coeff = 1 - (step - spars_warmup_steps) / (total_step - spars_schedu_steps)
             threshold = final_threshold + (initial_threshold - final_threshold) * (mul_coeff ** 3)
-            mask_ind = True if step % self.deltaT == 0 else False
+
+        mask_ind = True if step % self.deltaT == 0 else False
+        if mask_ind:  # Only update threshold on deltaT steps
+            self.current_threshold = threshold
         return threshold, mask_ind
 
     def update_ipt_with_local_window(self, model, global_step):
@@ -405,20 +407,25 @@ class Pruner(object):
             all_is.append(is_score.view(-1))
         
         all_is = torch.cat(all_is)
-        mask_threshold = torch.kthvalue(all_is, int(all_is.shape[0] * (1 - threshold)))[0].item()
+        num_elements = all_is.shape[0]
+        
+        # Ensure k is within valid range [1, num_elements]
+        k = max(1, min(num_elements, int(num_elements * (1 - self.current_threshold))))
+        mask_threshold = torch.kthvalue(all_is, k)[0].item()
         
         # Mask weights whose importance lower than threshold
         total_weights = 0
         total_pruned = 0
         for n, p in model.named_parameters():
             if self.whether_mask_para(n):
-                num_zeros_before = (p.data == 0).sum().item()
-                mask = is_dict[n] < mask_threshold
-                p.data.masked_fill_(mask, 0.0)
-                num_zeros_after = (p.data == 0).sum().item()
-                pruned = num_zeros_after - num_zeros_before
-                total_pruned += pruned
-                total_weights += p.numel()
+                if n in is_dict:  # Only process if we have importance scores
+                    num_zeros_before = (p.data == 0).sum().item()
+                    mask = is_dict[n] < mask_threshold
+                    p.data.masked_fill_(mask, 0.0)
+                    num_zeros_after = (p.data == 0).sum().item()
+                    pruned = num_zeros_after - num_zeros_before
+                    total_pruned += pruned
+                    total_weights += p.numel()
         
         return mask_threshold
 
@@ -427,10 +434,7 @@ class Pruner(object):
         self.update_ipt_with_local_window(model, global_step)
         # Get the remaining ratio
         threshold, mask_ind = self.schedule_threshold_comb(global_step)
-        if mask_ind:
-            # Mask weights during masking horizon
-            mask_threshold = self.mask_with_threshold(model, threshold)
-        else:
-            mask_threshold = None
+        # Always apply masking with current threshold
+        mask_threshold = self.mask_with_threshold(model, threshold)
         return threshold, mask_threshold
 
