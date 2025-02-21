@@ -304,6 +304,7 @@ def main():
             self.pruner: utils.Pruner = pruner
             self.step = 0
             self.logger = get_logger(__name__)
+            self.pruning_masks = {}  # Store pruning masks
 
         def count_zero_params(self, model):
             total_params = 0
@@ -331,8 +332,18 @@ def main():
 
                 if mask_threshold is not None:
                     self.logger.info(f"Step {state.global_step + 1}: Gradual pruning phase - Applying pruning with threshold {threshold:.4f}")
+                    # Store pruning masks when they're updated
+                    for name, param in model.named_parameters():
+                        if 'sparse' in name:
+                            self.pruning_masks[name] = (param.data == 0).clone()
                 else:
                     self.logger.info(f"Step {state.global_step + 1}: Gradual pruning phase - No pruning this step (deltaT={self.pruner.deltaT})")
+                    # Reapply existing masks
+                    if self.pruning_masks:
+                        for name, param in model.named_parameters():
+                            if name in self.pruning_masks:
+                                param.data.masked_fill_(self.pruning_masks[name], 0.0)
+                
                 # Count and log zero parameters after pruning
                 total_params, zero_params = self.count_zero_params(model)
                 self.logger.info(f"Step {state.global_step + 1}: Zero parameters: {zero_params}/{total_params} ({100 * zero_params / total_params:.2f}%)")
@@ -340,6 +351,12 @@ def main():
         def on_evaluate(self, args, state, control, metrics=None, **kwargs):
             """Called during evaluation"""
             model = kwargs['model']
+            
+            # Reapply pruning masks before evaluation
+            if self.pruning_masks:
+                for name, param in model.named_parameters():
+                    if name in self.pruning_masks:
+                        param.data.masked_fill_(self.pruning_masks[name], 0.0)
             
             # Count zero parameters before evaluation
             total_params, zero_params = self.count_zero_params(model)
@@ -352,6 +369,12 @@ def main():
         def on_train_end(self, args, state, control, **kwargs):
             """Called at the end of training"""
             model = kwargs['model']
+            
+            # Reapply pruning masks for final model
+            if self.pruning_masks:
+                for name, param in model.named_parameters():
+                    if name in self.pruning_masks:
+                        param.data.masked_fill_(self.pruning_masks[name], 0.0)
             
             # Count and log final zero parameters
             total_params, zero_params = self.count_zero_params(model)
