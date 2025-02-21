@@ -410,6 +410,15 @@ def main():
 
     # If we're only evaluating
     if args.eval_checkpoint is not None:
+        # Try to load pruning masks if they exist
+        masks_path = os.path.join(os.path.dirname(args.eval_checkpoint), "pruning_masks.pt")
+        if os.path.exists(masks_path):
+            pruning_masks = torch.load(masks_path)
+            # Apply masks to the model
+            for name, param in model.named_parameters():
+                if name in pruning_masks:
+                    param.data.masked_fill_(pruning_masks[name], 0.0)
+        
         trainer = Trainer(
             model=model,
             args=training_args,
@@ -438,10 +447,31 @@ def main():
     
     # Save the final model
     if args.output_dir is not None:
-        trainer.save_model(args.output_dir)
-    
-    if args.push_to_hub:
-        trainer.push_to_hub()
+        accelerator.wait_for_everyone()
+        unwrapped_model = accelerator.unwrap_model(model)
+        
+        # Reapply pruning masks before saving
+        if hasattr(trainer.callback_handler.callbacks[0], 'pruning_masks'):
+            pruning_callback = trainer.callback_handler.callbacks[0]
+            for name, param in unwrapped_model.named_parameters():
+                if name in pruning_callback.pruning_masks:
+                    param.data.masked_fill_(pruning_callback.pruning_masks[name], 0.0)
+            
+            # Save pruning masks alongside the model
+            torch.save(
+                pruning_callback.pruning_masks,
+                os.path.join(args.output_dir, "pruning_masks.pt")
+            )
+        
+        unwrapped_model.save_pretrained(
+            args.output_dir, 
+            is_main_process=accelerator.is_main_process, 
+            save_function=accelerator.save
+        )
+        if accelerator.is_main_process:
+            tokenizer.save_pretrained(args.output_dir)
+            if args.push_to_hub:
+                repo.push_to_hub(commit_message="End of training", auto_lfs_prune=True)
 
     # Run final evaluation
     logger.info("Running final evaluation...")
