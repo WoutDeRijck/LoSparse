@@ -420,5 +420,10 @@ def main():
     if args.push_to_hub:
         trainer.push_to_hub()
 
+    # Run final evaluation
+    logger.info("Running final evaluation...")
+    final_metrics = trainer.evaluate()
+    logger.info(f"Final evaluation metrics: {final_metrics}")
+
 if __name__ == "__main__":
     main()
