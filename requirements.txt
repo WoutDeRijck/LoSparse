@@ -12,3 +12,5 @@ filelock
 rouge-score
 nltk
 tensorboard
+matplotlib
+seaborn

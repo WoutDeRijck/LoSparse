@@ -372,9 +372,23 @@ def main():
             
             # Reapply pruning masks for final model
             if self.pruning_masks:
+                self.logger.info("Applying final pruning masks in on_train_end callback...")
+                
+                # Count before applying masks
+                total_before, zero_before = self.count_zero_params(model)
+                
+                # Apply masks to ensure zeros are preserved
                 for name, param in model.named_parameters():
                     if name in self.pruning_masks:
                         param.data.masked_fill_(self.pruning_masks[name], 0.0)
+                
+                # Count after applying masks
+                total_after, zero_after = self.count_zero_params(model)
+                
+                # Log detailed information
+                self.logger.info(f"Before final mask application: {zero_before}/{total_before} zeros ({100 * zero_before / total_before:.2f}%)")
+                self.logger.info(f"After final mask application: {zero_after}/{total_after} zeros ({100 * zero_after / total_after:.2f}%)")
+                self.logger.info(f"Change in zero parameters: {zero_after - zero_before}")
             
             # Count and log final zero parameters
             total_params, zero_params = self.count_zero_params(model)
@@ -382,6 +396,10 @@ def main():
             self.logger.info(f"Total parameters: {total_params}")
             self.logger.info(f"Zero parameters: {zero_params}")
             self.logger.info(f"Pruning ratio: {100 * zero_params / total_params:.2f}%")
+            
+            # Store pruning masks as an attribute of the model for easier access during saving
+            model.pruning_masks = {k: v.clone() for k, v in self.pruning_masks.items()}
+            
             return control
 
     # Calculate max_train_steps if not provided
@@ -450,27 +468,115 @@ def main():
         accelerator.wait_for_everyone()
         unwrapped_model = accelerator.unwrap_model(model)
         
-        # Reapply pruning masks before saving
+        # Get pruning masks
+        pruning_masks = None
+        
+        # First check if the callback has masks
         if hasattr(trainer.callback_handler.callbacks[0], 'pruning_masks'):
             pruning_callback = trainer.callback_handler.callbacks[0]
-            for name, param in unwrapped_model.named_parameters():
-                if name in pruning_callback.pruning_masks:
-                    param.data.masked_fill_(pruning_callback.pruning_masks[name], 0.0)
-            
-            # Save pruning masks alongside the model
-            torch.save(
-                pruning_callback.pruning_masks,
-                os.path.join(args.output_dir, "pruning_masks.pt")
-            )
+            if pruning_callback.pruning_masks:
+                pruning_masks = pruning_callback.pruning_masks
+                logger.info("Found pruning masks in callback")
         
-        unwrapped_model.save_pretrained(
-            args.output_dir, 
-            is_main_process=accelerator.is_main_process, 
-            save_function=accelerator.save
-        )
+        # If not found in callback, check if model has masks
+        if pruning_masks is None and hasattr(unwrapped_model, 'pruning_masks'):
+            pruning_masks = unwrapped_model.pruning_masks
+            logger.info("Found pruning masks in model")
+        
+        # Apply masks if found
+        if pruning_masks:
+            logger.info("Applying pruning masks to final model before saving...")
+            
+            # Apply masks directly to model parameters
+            for name, param in unwrapped_model.named_parameters():
+                if name in pruning_masks:
+                    param.data.masked_fill_(pruning_masks[name], 0.0)
+                    logger.info(f"Applied mask to {name}")
+            
+            # Count zero parameters in the model
+            total_params = 0
+            zero_params = 0
+            for name, param in unwrapped_model.named_parameters():
+                if 'sparse' in name:
+                    total_params += param.numel()
+                    zero_params += (param == 0).sum().item()
+            
+            if total_params > 0:
+                logger.info(f"Model before saving - Sparse parameters: {zero_params}/{total_params} zeros ({100 * zero_params / total_params:.2f}%)")
+            
+            # Count all parameters
+            all_total = 0
+            all_zeros = 0
+            for name, param in unwrapped_model.named_parameters():
+                all_total += param.numel()
+                all_zeros += (param == 0).sum().item()
+            
+            logger.info(f"Model before saving - All parameters: {all_zeros}/{all_total} zeros ({100 * all_zeros / all_total:.2f}%)")
+        else:
+            logger.warning("No pruning masks found before saving! The model may not be properly pruned.")
+        
+        # Save the model with pruned weights
+        logger.info("Saving pruned model...")
+        
+        # Create output directory if it doesn't exist
+        os.makedirs(args.output_dir, exist_ok=True)
+        
+        # Save the model directly using PyTorch's save function
+        # This ensures all parameter values (including zeros from pruning) are preserved exactly
+        model_path = os.path.join(args.output_dir, "pytorch_model.bin")
+        logger.info(f"Saving model to {model_path}")
+        
+        # Get state dict with pruned weights
+        state_dict = unwrapped_model.state_dict()
+        
+        # Save the state dict
+        torch.save(state_dict, model_path)
+        
+        # Save the config
+        unwrapped_model.config.save_pretrained(args.output_dir)
+        
+        # Save the tokenizer
         if accelerator.is_main_process:
             tokenizer.save_pretrained(args.output_dir)
+        
+        # Verify the saved model has pruned weights
+        if accelerator.is_main_process:
+            logger.info("Verifying saved model has pruned weights...")
+            
+            # Load the saved model
+            saved_model = AutoModelForSequenceClassification.from_pretrained(args.output_dir)
+            
+            # Count zero parameters in the saved model
+            saved_total = 0
+            saved_zeros = 0
+            for name, param in saved_model.named_parameters():
+                saved_total += param.numel()
+                saved_zeros += (param == 0).sum().item()
+            
+            logger.info(f"Saved model - All parameters: {saved_zeros}/{saved_total} zeros ({100 * saved_zeros / saved_total:.2f}%)")
+            
+            # Compare with original model
+            if all_total > 0 and saved_total > 0:
+                original_ratio = 100 * all_zeros / all_total
+                saved_ratio = 100 * saved_zeros / saved_total
+                
+                logger.info(f"Original model pruning ratio: {original_ratio:.2f}%")
+                logger.info(f"Saved model pruning ratio: {saved_ratio:.2f}%")
+                
+                if abs(original_ratio - saved_ratio) < 0.1:  # Allow small difference due to floating point
+                    logger.info("SUCCESS: Saved model has the same pruning ratio as the original model")
+                else:
+                    logger.warning(f"WARNING: Saved model pruning ratio ({saved_ratio:.2f}%) differs from original ({original_ratio:.2f}%)")
+            
+            # Clean up
+            del saved_model
+            import gc
+            gc.collect()
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+            
+            # Push to hub if requested
             if args.push_to_hub:
+                repo = Repository(args.output_dir, clone_from=args.hub_model_id)
                 repo.push_to_hub(commit_message="End of training", auto_lfs_prune=True)
 
     # Run final evaluation
