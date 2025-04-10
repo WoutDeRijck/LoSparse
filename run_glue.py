@@ -310,7 +310,7 @@ def main():
 
     training_args = TrainingArguments(
         output_dir=args.output_dir,
-        evaluation_strategy="steps",
+        eval_strategy="steps",
         eval_steps=args.eval_steps,
         learning_rate=args.learning_rate,
         per_device_train_batch_size=args.per_device_train_batch_size,
