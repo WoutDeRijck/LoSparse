@@ -189,8 +189,8 @@ def main():
             config=config,
         )
         # Apply model modifications only for training
-        allow_name = ['Wqkv', 'Wo', 'Wi', 'dense']
-        block_name = ['embeddings', 'norm', 'head', 'classifier', 'final_norm']
+        allow_name = ['Wqkv', 'Wo', 'Wi', 'dense', 'tok_embeddings']
+        block_name = ['norm', 'head', 'classifier', 'final_norm']
 
         utils.substitute_layer_weights(
             module=model,
