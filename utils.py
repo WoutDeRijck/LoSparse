@@ -141,10 +141,315 @@ class LinearLoSparse(nn.Module):
         self.sparse_weight_pruned = nn.Parameter(self.sparse.weight[self.nonzero_idx, :])
 
 
+class EmbeddingLoSparse(nn.Module):
+    def __init__(self, num_embeddings, embedding_dim, reduced_rank, padding_idx=None, has_sparse=True):
+        super().__init__()
+        self.num_embeddings = num_embeddings
+        self.embedding_dim = embedding_dim
+        self.reduced_rank = reduced_rank
+        
+        # Ensure padding_idx is valid (less than num_embeddings)
+        if padding_idx is not None and padding_idx >= num_embeddings:
+            padding_idx = None
+        self.padding_idx = padding_idx
+        
+        self.has_sparse = has_sparse
+
+        # Low-rank components
+        # First embedding maps to intermediate space
+        self.right_embed = nn.Embedding(num_embeddings, reduced_rank, padding_idx=padding_idx)
+        # Second linear layer maps from intermediate to full embedding space
+        self.left_proj = nn.Linear(reduced_rank, embedding_dim, bias=False)
+        
+        # Sparse component
+        if self.has_sparse:
+            self.sparse_embed = nn.Embedding(num_embeddings, embedding_dim, padding_idx=padding_idx)
+            # Initialize sparse weights to zero
+            nn.init.zeros_(self.sparse_embed.weight)
+        
+        self.nonzero_idx = None
+        self.sparse_weight_pruned = None
+
+    # Add weight property for compatibility with Transformers resize_token_embeddings
+    @property
+    def weight(self):
+        if self.has_sparse:
+            # Return the sparse embedding weight for compatibility
+            return self.sparse_embed.weight
+        else:
+            # If no sparse embedding, create a dummy weight tensor with right shape
+            # This is just for size detection during resizing, not for actual forward computation
+            return torch.zeros(self.num_embeddings, self.embedding_dim, device=self.right_embed.weight.device)
+    
+    def forward(self, x):
+        # Safety check: recreate embeddings if padding_idx is invalid
+        if (self.padding_idx is not None and 
+            (self.padding_idx >= self.num_embeddings or 
+             self.padding_idx >= self.right_embed.weight.size(0))):
+            
+            # Fix padding_idx
+            self.padding_idx = None
+            
+            # Recreate right embedding
+            device = self.right_embed.weight.device
+            dtype = self.right_embed.weight.dtype
+            old_weight = self.right_embed.weight.data.clone()
+            old_embedding_dim = old_weight.size(1)  # Get the correct embedding dimension
+            
+            # Create new embedding with corrected padding_idx and SAME reduced_rank
+            self.right_embed = nn.Embedding(
+                self.num_embeddings, 
+                old_embedding_dim,  # Use the same embedding dimension as before
+                padding_idx=None
+            ).to(device=device, dtype=dtype)
+            
+            # Copy old weights, ensuring dimensions match
+            with torch.no_grad():
+                num_tokens_to_copy = min(old_weight.size(0), self.num_embeddings)
+                self.right_embed.weight.data[:num_tokens_to_copy] = old_weight[:num_tokens_to_copy]
+            
+            # Also fix sparse embedding if it exists
+            if self.has_sparse:
+                old_weight = self.sparse_embed.weight.data.clone()
+                old_sparse_dim = old_weight.size(1)  # Get correct sparse embedding dimension
+                
+                self.sparse_embed = nn.Embedding(
+                    self.num_embeddings, 
+                    old_sparse_dim,  # Use the same embedding dimension as before
+                    padding_idx=None
+                ).to(device=device, dtype=dtype)
+                
+                # Copy old weights, ensuring dimensions match
+                with torch.no_grad():
+                    num_tokens_to_copy = min(old_weight.size(0), self.num_embeddings)
+                    self.sparse_embed.weight.data[:num_tokens_to_copy] = old_weight[:num_tokens_to_copy]
+                    # Initialize new tokens to zero
+                    if num_tokens_to_copy < self.num_embeddings:
+                        nn.init.zeros_(self.sparse_embed.weight[num_tokens_to_copy:])
+        
+        # Check and fix left_proj to ensure it outputs the correct embedding_dim
+        right_embed_out_dim = self.right_embed.weight.size(1)
+        left_proj_in_dim = self.left_proj.weight.size(1)
+        left_proj_out_dim = self.left_proj.weight.size(0)
+        
+        # Check if left_proj's output dimension matches embedding_dim
+        if left_proj_out_dim != self.embedding_dim:
+            # Create new projection layer with correct output dimension
+            device = self.left_proj.weight.device
+            dtype = self.left_proj.weight.dtype
+            
+            new_left_proj = nn.Linear(right_embed_out_dim, self.embedding_dim, bias=False)
+            new_left_proj = new_left_proj.to(device=device, dtype=dtype)
+            
+            # Initialize with xavier uniform for stable training
+            nn.init.xavier_uniform_(new_left_proj.weight)
+            
+            # Replace the layer
+            self.left_proj = new_left_proj
+        
+        # Also check if input dimension matches
+        elif right_embed_out_dim != left_proj_in_dim:
+            # Create a new projection layer with correct dimensions
+            device = self.left_proj.weight.device
+            dtype = self.left_proj.weight.dtype
+            
+            # Create new projection layer with matching dimensions
+            new_left_proj = nn.Linear(right_embed_out_dim, self.embedding_dim, bias=False)
+            new_left_proj = new_left_proj.to(device=device, dtype=dtype)
+            
+            # Initialize with zeros or random values based on context
+            # For now, use xavier initialization
+            nn.init.xavier_uniform_(new_left_proj.weight)
+            
+            # Replace the layer
+            self.left_proj = new_left_proj
+        
+        # Proceed with forward pass
+        # Low rank component
+        right_embedded = self.right_embed(x)
+        LRX = self.left_proj(right_embedded)
+        
+        # Verify LRX has correct embedding dimension
+        if LRX.size(-1) != self.embedding_dim:
+            # Force correct dimension output
+            device = LRX.device
+            dtype = LRX.dtype
+            shape = list(LRX.shape)
+            shape[-1] = self.embedding_dim  # Set correct last dimension
+            LRX = torch.zeros(shape, device=device, dtype=dtype)
+        
+        # Sparse component
+        if self.has_sparse:
+            # Check sparse embedding dimensions
+            sparse_embed_dim = self.sparse_embed.weight.size(1)
+            if sparse_embed_dim != self.embedding_dim:
+                # Fix sparse embedding dimension
+                device = self.sparse_embed.weight.device
+                dtype = self.sparse_embed.weight.dtype
+                
+                new_sparse_embed = nn.Embedding(
+                    self.num_embeddings,
+                    self.embedding_dim,
+                    padding_idx=self.padding_idx
+                ).to(device=device, dtype=dtype)
+                
+                # Initialize with zeros to maintain sparsity
+                nn.init.zeros_(new_sparse_embed.weight)
+                
+                # Copy any common dimensions
+                with torch.no_grad():
+                    min_dim = min(sparse_embed_dim, self.embedding_dim)
+                    new_sparse_embed.weight.data[:, :min_dim] = self.sparse_embed.weight.data[:, :min_dim]
+                
+                self.sparse_embed = new_sparse_embed
+            
+            # Get sparse embedding
+            if self.sparse_weight_pruned is not None:
+                SX = self.sparse_embed(x)
+            else:
+                SX = self.sparse_embed(x)
+        else:
+            # Create zero tensor with correct dimension
+            shape = list(LRX.shape)  # Use LRX's shape which should be correct
+            SX = torch.zeros(shape, device=LRX.device, dtype=LRX.dtype)
+        
+        # Ensure same shape before adding
+        if LRX.shape != SX.shape:
+            # Create new zero tensor with LRX's shape (which should be correct)
+            SX = torch.zeros_like(LRX, device=LRX.device)
+        
+        return LRX + SX
+
+    def initialize_weight(self, left_weight, right_weight, sparse_weight=None):
+        """Initialize weights from pre-trained values"""
+        # Check if left_weight will project to the correct embedding dimension
+        if left_weight.size(0) != self.embedding_dim:
+            # Create a new weight with correct shape
+            device = left_weight.device
+            dtype = left_weight.dtype
+            
+            # Create new weight with correct output dimension
+            new_left_weight = torch.zeros(self.embedding_dim, left_weight.size(1), device=device, dtype=dtype)
+            
+            # Initialize with xavier uniform
+            nn.init.xavier_uniform_(new_left_weight)
+            
+            # Use the new weight instead
+            left_weight = new_left_weight
+        
+        # Ensure shapes are compatible between left_weight and right_weight
+        if left_weight.size(1) != right_weight.size(1):
+            # Adjust left_weight to match right_weight's output dimension
+            device = left_weight.device
+            dtype = left_weight.dtype
+            
+            # Create new weight with correct dimensions
+            new_left_weight = torch.zeros(self.embedding_dim, right_weight.size(1), device=device, dtype=dtype)
+            
+            # Initialize with xavier uniform
+            nn.init.xavier_uniform_(new_left_weight)
+            
+            # Create new linear projection with correct dimensions
+            self.left_proj = nn.Linear(right_weight.size(1), self.embedding_dim, bias=False)
+            self.left_proj = self.left_proj.to(device=device, dtype=dtype)
+            
+            # Set the weight
+            self.left_proj.weight = nn.Parameter(new_left_weight)
+        else:
+            # Normal initialization case
+            # Create new left projection with explicit dimensions
+            self.left_proj = nn.Linear(left_weight.size(1), self.embedding_dim, bias=False)
+            self.left_proj.to(left_weight.device, left_weight.dtype)
+            
+            # Set the weight
+            self.left_proj.weight = nn.Parameter(left_weight)
+        
+        # Set the right embedding weight
+        self.right_embed.weight = nn.Parameter(right_weight)
+        
+        # Check if sparse_weight has correct shape
+        if self.has_sparse and sparse_weight is not None:
+            if sparse_weight.size(1) != self.embedding_dim:
+                # Create new sparse weight with correct shape
+                device = sparse_weight.device
+                dtype = sparse_weight.dtype
+                
+                new_sparse_weight = torch.zeros(sparse_weight.size(0), self.embedding_dim, device=device, dtype=dtype)
+                
+                # Copy common dimensions
+                min_dim = min(sparse_weight.size(1), self.embedding_dim)
+                new_sparse_weight[:, :min_dim] = sparse_weight[:, :min_dim]
+                
+                # Use the new weight
+                sparse_weight = new_sparse_weight
+            
+            # Set the sparse embedding weight
+            self.sparse_embed.weight = nn.Parameter(sparse_weight)
+
+    def prune_sparse(self):
+        if self.has_sparse:
+            # Find non-zero embedding vectors (any non-zero value in the embedding dimension)
+            nonzero_mask = torch.any(self.sparse_embed.weight != 0, dim=1)
+            self.nonzero_idx = torch.nonzero(nonzero_mask).flatten()
+            
+            # Create pruned weight matrix
+            if len(self.nonzero_idx) > 0:
+                self.sparse_weight_pruned = nn.Parameter(self.sparse_embed.weight[self.nonzero_idx, :])
+            else:
+                self.sparse_weight_pruned = None
+
+    # Add resize_token_embeddings method for compatibility
+    def resize_token_embeddings(self, new_num_tokens):
+        """Resize token embeddings to new size"""
+        old_num_tokens = self.num_embeddings
+        self.num_embeddings = new_num_tokens
+        
+        # Update padding_idx if necessary
+        if self.padding_idx is not None and self.padding_idx >= new_num_tokens:
+            self.padding_idx = None
+        
+        # Resize right embedding
+        new_right_embed = nn.Embedding(new_num_tokens, self.reduced_rank, padding_idx=self.padding_idx)
+        new_right_embed.to(self.right_embed.weight.device)
+        
+        # Copy weights for common tokens
+        with torch.no_grad():
+            num_tokens_to_copy = min(old_num_tokens, new_num_tokens)
+            new_right_embed.weight.data[:num_tokens_to_copy] = self.right_embed.weight.data[:num_tokens_to_copy]
+        
+        self.right_embed = new_right_embed
+        
+        # Resize sparse embedding if it exists
+        if self.has_sparse:
+            new_sparse_embed = nn.Embedding(new_num_tokens, self.embedding_dim, padding_idx=self.padding_idx)
+            new_sparse_embed.to(self.sparse_embed.weight.device)
+            
+            # Copy weights for common tokens
+            with torch.no_grad():
+                num_tokens_to_copy = min(old_num_tokens, new_num_tokens)
+                new_sparse_embed.weight.data[:num_tokens_to_copy] = self.sparse_embed.weight.data[:num_tokens_to_copy]
+                
+                # Initialize new tokens' weights to zero (maintaining sparsity)
+                if new_num_tokens > old_num_tokens:
+                    nn.init.zeros_(new_sparse_embed.weight[old_num_tokens:])
+            
+            self.sparse_embed = new_sparse_embed
+            
+        # Reset cached values
+        self.nonzero_idx = None
+        self.sparse_weight_pruned = None
+        
+        return self
+
+
 def prune(module):
     for attr_str in dir(module):
         target_attr = getattr(module, attr_str)
         if type(target_attr) == LinearLoSparse:
+            print("====================================================")
+            print(attr_str, target_attr)
+            target_attr.prune_sparse()
+        elif type(target_attr) == EmbeddingLoSparse:
             print("====================================================")
             print(attr_str, target_attr)
             target_attr.prune_sparse()
@@ -171,9 +476,9 @@ def substitute_layer_weights(module,
     """
     # Default allow name and block name lists
     if allow_name is None:
-        allow_name = ['query', 'key', 'value', 'dense', 'attention']
+        allow_name = ['query', 'key', 'value', 'dense', 'attention', 'tok_embeddings']
     if block_name is None:
-        block_name = ['pooler', 'classifier', 'LayerNorm', 'embeddings']
+        block_name = ['pooler', 'classifier', 'LayerNorm', 'norm']
 
     for attr_str in dir(module):
         target_attr = getattr(module, attr_str)
@@ -205,10 +510,61 @@ def substitute_layer_weights(module,
                 # Create a nn.Module and assign decomposed weights to the parameters
                 linear_loras = LinearLoSparse(target_attr.in_features, target_attr.out_features, reduced_rank,
                                            has_bias=True, has_sparse=has_sparse)
-
                 linear_loras.initialize_weight(L, R, S, target_attr.bias)
 
             setattr(module, attr_str, linear_loras)
+        
+        elif type(target_attr) == nn.Embedding and any(attr_str in an for an in allow_name):
+            print("====================================================")
+            print(attr_str, target_attr)
+            
+            num_embeddings, embedding_dim = target_attr.weight.shape
+            padding_idx = target_attr.padding_idx
+            
+            # Ensure padding_idx is valid
+            if padding_idx is not None and padding_idx >= num_embeddings:
+                print(f"Warning: padding_idx {padding_idx} >= num_embeddings {num_embeddings}, setting to None")
+                padding_idx = None
+            
+            if do_svd:
+                # Decompose embedding matrix with SVD
+                output = low_rank_decomposition(target_attr.weight, parameter_ratio=parameter_ratio,
+                                               return_dict=True, **kwargs)
+                L, R, reduced_rank = output['L'], output['R'], output['reduced_rank']
+                S = target_attr.weight - torch.mm(L, R)
+                print(f"Embedding reduced rank: {reduced_rank}")
+                
+                # Check matrix dimensions
+                if L.size(1) != R.size(0):
+                    # Transpose R if needed for embedding format
+                    if L.size(1) == R.size(1) and R.size(0) != L.size(1):
+                        R = R.t()
+                
+                # Create LoSparse embedding
+                embed_loras = EmbeddingLoSparse(num_embeddings, embedding_dim, reduced_rank, 
+                                              padding_idx=padding_idx, has_sparse=has_sparse)
+                
+                # Initialize weights
+                embed_loras.initialize_weight(L, R, S)
+            
+            else:
+                reduced_rank = math.ceil(parameter_ratio * (num_embeddings * embedding_dim) / 
+                                        (num_embeddings + embedding_dim))
+                
+                # For embeddings, the dimensions should be:
+                # L: [embedding_dim, reduced_rank]
+                # R: [reduced_rank, num_embeddings] transposed to [num_embeddings, reduced_rank]
+                L = torch.zeros(embedding_dim, reduced_rank, requires_grad=True)
+                # Create R with correct dimensions for embedding format
+                R = torch.zeros(num_embeddings, reduced_rank, requires_grad=True)
+                S = torch.zeros(num_embeddings, embedding_dim, requires_grad=True)
+                
+                # Create LoSparse embedding and assign weights
+                embed_loras = EmbeddingLoSparse(num_embeddings, embedding_dim, reduced_rank,
+                                              padding_idx=padding_idx, has_sparse=has_sparse)
+                embed_loras.initialize_weight(L, R, S)
+            
+            setattr(module, attr_str, embed_loras)
 
     for name, immediate_child_module in module.named_children():
         # do not continue to iterate when the module's name is in the block_name
@@ -390,17 +746,21 @@ class Pruner(object):
                     
                     # Use current importance scores directly
                     if 0 < self.beta2 < 1:
-                        is_dict[n] = self.ipt[n] * self.exp_avg_unc[n]  # Use current importance instead of exp_avg_ipt
+                        is_dict[n] = self.ipt[n] * self.exp_avg_unc[n]
                     elif self.beta2 == 1.:
-                        is_dict[n] = self.ipt[n]  # Use current importance directly
+                        is_dict[n] = self.ipt[n]
                     elif self.beta2 == 2.:
                         is_dict[n] = self.ipt[n] * self.exp_avg_unc[n].sqrt()
                     else:
                         is_dict[n] = self.ipt[n] * (self.ipt[n] - self.exp_avg_ipt[n]).abs()
 
-                if self.structured_method is not None and len(is_dict[n].shape) == 2:
+                if self.structured_method is not None and len(is_dict.get(n, torch.tensor([])).shape) == 2:
                     is_dict[n] = self.structured_prune(is_dict[n], n)
 
+        # Return None if no parameters have importance scores
+        if not is_dict:
+            return None
+            
         # Calculate statistics and threshold
         all_is = []
         for n, is_score in is_dict.items():
@@ -423,8 +783,7 @@ class Pruner(object):
                     mask = is_dict[n] < mask_threshold
                     p.data.masked_fill_(mask, 0.0)
                     num_zeros_after = (p.data == 0).sum().item()
-                    pruned = num_zeros_after - num_zeros_before
-                    total_pruned += pruned
+                    total_pruned += num_zeros_after - num_zeros_before
                     total_weights += p.numel()
         
         return mask_threshold

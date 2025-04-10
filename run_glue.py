@@ -41,6 +41,7 @@ from transformers import (
 from transformers.utils import get_full_repo_name, send_example_telemetry
 import utils
 import numpy as np
+import torch.nn as nn
 
 logger = logging.getLogger(__name__)
 
@@ -198,6 +199,41 @@ def main():
             parameter_ratio=args.low_rank_parameter_ratio,
             do_svd=True
         )
+        
+        # Add safety check for embeddings after substitution
+        for name, module in model.named_modules():
+            if isinstance(module, utils.EmbeddingLoSparse):
+                # Validate padding_idx
+                if module.padding_idx is not None and module.padding_idx >= module.num_embeddings:
+                    logger.warning(f"Found invalid padding_idx in {name}: {module.padding_idx} >= {module.num_embeddings}")
+                    module.padding_idx = None
+                    
+                    # Recreate embeddings with correct padding_idx
+                    device = module.right_embed.weight.device
+                    dtype = module.right_embed.weight.dtype
+                    
+                    # Right embedding
+                    old_right_weight = module.right_embed.weight.data.clone()
+                    old_reduced_rank = old_right_weight.size(1)  # Get the actual reduced rank dimension
+                    
+                    module.right_embed = nn.Embedding(
+                        module.num_embeddings,
+                        old_reduced_rank,  # Use actual dimension instead of module.reduced_rank
+                        padding_idx=None
+                    ).to(device=device, dtype=dtype)
+                    module.right_embed.weight.data.copy_(old_right_weight)
+                    
+                    # Sparse embedding
+                    if module.has_sparse:
+                        old_sparse_weight = module.sparse_embed.weight.data.clone()
+                        old_embedding_dim = old_sparse_weight.size(1)  # Get actual embedding dimension
+                        
+                        module.sparse_embed = nn.Embedding(
+                            module.num_embeddings,
+                            old_embedding_dim,  # Use actual dimension instead of module.embedding_dim
+                            padding_idx=None
+                        ).to(device=device, dtype=dtype)
+                        module.sparse_embed.weight.data.copy_(old_sparse_weight)
 
     model.resize_token_embeddings(len(tokenizer))
 
