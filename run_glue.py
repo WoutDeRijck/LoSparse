@@ -41,6 +41,8 @@ from transformers import (
 from transformers.utils import get_full_repo_name, send_example_telemetry
 import utils
 import numpy as np
+# Import custom split utilities
+from split_utils import prepare_custom_split_datasets, prepare_original_val_datasets
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +95,15 @@ def parse_args():
     parser.add_argument("--max_train_samples", type=int, default=None, help="For debugging purposes or quicker training, truncate the number of training examples to this value if set.")
     parser.add_argument("--max_eval_samples", type=int, default=None, help="For debugging purposes or quicker evaluation, truncate the number of evaluation examples to this value if set.")
     parser.add_argument("--eval_steps", type=int, default=50, help="Number of steps between evaluations.")
+    
+    # Add custom split arguments
+    parser.add_argument("--use_custom_splits", action="store_true", help="Whether to use custom train/val/test splits")
+    parser.add_argument("--custom_split_type", type=str, default="original_val", choices=["full_custom", "original_val"], help="Type of custom split to use")
+    parser.add_argument("--train_ratio", type=float, default=0.8, help="Ratio of data to use for training (for full_custom)")
+    parser.add_argument("--validation_ratio", type=float, default=0.1, help="Ratio of data to use for validation (for full_custom)")
+    parser.add_argument("--test_ratio", type=float, default=0.1, help="Ratio of data to use for testing")
+    parser.add_argument("--train_test_ratio", type=float, default=0.9, help="Ratio of original training data to use for training (for original_val)")
+    
     args = parser.parse_args()
 
     if args.task_name is None and args.train_file is None and args.validation_file is None:
@@ -152,11 +163,13 @@ def main():
             os.makedirs(args.output_dir, exist_ok=True)
     accelerator.wait_for_everyone()
 
-    # Get the datasets
-    raw_datasets = load_dataset("glue", args.task_name)
+    # Get dataset info
     is_regression = args.task_name == "stsb"
+    
+    # Get label information from the raw dataset
+    temp_dataset = load_dataset("glue", args.task_name)
     if not is_regression:
-        label_list = raw_datasets["train"].features["label"].names
+        label_list = temp_dataset["train"].features["label"].names
         num_labels = len(label_list)
     else:
         num_labels = 1
@@ -201,7 +214,91 @@ def main():
 
     model.resize_token_embeddings(len(tokenizer))
 
-    sentence1_key, sentence2_key = task_to_keys[args.task_name]
+    # Use custom splits if requested
+    if args.use_custom_splits:
+        logger.info("Using custom dataset splits")
+        
+        if args.custom_split_type == "full_custom":
+            logger.info(f"Creating fully custom splits with ratios: train={args.train_ratio}, "
+                       f"validation={args.validation_ratio}, test={args.test_ratio}")
+            train_dataset, eval_dataset, test_dataset = prepare_custom_split_datasets(
+                task_name=args.task_name,
+                tokenizer=tokenizer,
+                train_ratio=args.train_ratio,
+                validation_ratio=args.validation_ratio,
+                test_ratio=args.test_ratio,
+                max_length=args.max_length,
+                random_seed=args.seed if args.seed is not None else 42
+            )
+        else:  # original_val
+            logger.info(f"Using original validation set with train/test split: "
+                       f"train={args.train_test_ratio}, test={1.0-args.train_test_ratio}")
+            train_dataset, eval_dataset, test_dataset = prepare_original_val_datasets(
+                task_name=args.task_name,
+                tokenizer=tokenizer,
+                train_ratio=args.train_test_ratio,
+                test_ratio=1.0-args.train_test_ratio,
+                max_length=args.max_length,
+                random_seed=args.seed if args.seed is not None else 42
+            )
+            
+        # Apply max samples limits if specified
+        if args.max_train_samples is not None:
+            max_train_samples = min(len(train_dataset), args.max_train_samples)
+            train_dataset = train_dataset.select(range(max_train_samples))
+            logger.info(f"Truncated training dataset to {max_train_samples} examples")
+
+        if args.max_eval_samples is not None:
+            max_eval_samples = min(len(eval_dataset), args.max_eval_samples)
+            eval_dataset = eval_dataset.select(range(max_eval_samples))
+            logger.info(f"Truncated evaluation dataset to {max_eval_samples} examples")
+    else:
+        # Process datasets in the standard way
+        logger.info("Using standard dataset splits")
+        
+        # Get the datasets
+        raw_datasets = load_dataset("glue", args.task_name)
+        
+        # Define preprocessing function
+        padding = "max_length" if args.pad_to_max_length else False
+
+        def preprocess_function(examples):
+            sentence1_key, sentence2_key = task_to_keys[args.task_name]
+            texts = (
+                (examples[sentence1_key],) if sentence2_key is None else (examples[sentence1_key], examples[sentence2_key])
+            )
+            result = tokenizer(*texts, padding=padding, max_length=args.max_length, truncation=True)
+            if "label" in examples:
+                result["labels"] = examples["label"]
+            return result
+
+        with accelerator.main_process_first():
+            processed_datasets = raw_datasets.map(
+                preprocess_function,
+                batched=True,
+                remove_columns=raw_datasets["train"].column_names,
+                desc="Running tokenizer on dataset",
+            )
+
+        train_dataset = processed_datasets["train"]
+        eval_dataset = processed_datasets["validation_matched" if args.task_name == "mnli" else "validation"]
+        
+        # Create test dataset from validation for consistency
+        test_dataset = eval_dataset
+        
+        # Apply max samples limits if specified
+        if args.max_train_samples is not None:
+            max_train_samples = min(len(train_dataset), args.max_train_samples)
+            train_dataset = train_dataset.select(range(max_train_samples))
+            logger.info(f"Truncated training dataset to {max_train_samples} examples")
+
+        if args.max_eval_samples is not None:
+            max_eval_samples = min(len(eval_dataset), args.max_eval_samples)
+            eval_dataset = eval_dataset.select(range(max_eval_samples))
+            logger.info(f"Truncated evaluation dataset to {max_eval_samples} examples")
+
+    # Log dataset sizes
+    logger.info(f"Dataset sizes: train={len(train_dataset)}, validation={len(eval_dataset)}, test={len(test_dataset)}")
 
     label_to_id = None
     if (
@@ -231,41 +328,6 @@ def main():
     elif args.task_name is not None and not is_regression:
         model.config.label2id = {l: i for i, l in enumerate(label_list)}
         model.config.id2label = {id: label for label, id in config.label2id.items()}
-
-    padding = "max_length" if args.pad_to_max_length else False
-
-    def preprocess_function(examples):
-        texts = (
-            (examples[sentence1_key],) if sentence2_key is None else (examples[sentence1_key], examples[sentence2_key])
-        )
-        result = tokenizer(*texts, padding=padding, max_length=args.max_length, truncation=True)
-        if "label" in examples:
-            if not is_regression:
-                result["labels"] = examples["label"]
-            else:
-                result["labels"] = examples["label"]
-        return result
-
-    with accelerator.main_process_first():
-        processed_datasets = raw_datasets.map(
-            preprocess_function,
-            batched=True,
-            remove_columns=raw_datasets["train"].column_names,
-            desc="Running tokenizer on dataset",
-        )
-
-    train_dataset = processed_datasets["train"]
-    eval_dataset = processed_datasets["validation_matched" if args.task_name == "mnli" else "validation"]
-
-    if args.max_train_samples is not None:
-        max_train_samples = min(len(train_dataset), args.max_train_samples)
-        train_dataset = train_dataset.select(range(max_train_samples))
-        logger.info(f"Truncated training dataset to {max_train_samples} examples")
-
-    if args.max_eval_samples is not None:
-        max_eval_samples = min(len(eval_dataset), args.max_eval_samples)
-        eval_dataset = eval_dataset.select(range(max_eval_samples))
-        logger.info(f"Truncated evaluation dataset to {max_eval_samples} examples")
 
     data_collator = DataCollatorWithPadding(
         tokenizer, 
@@ -447,6 +509,13 @@ def main():
         )
         metrics = trainer.evaluate()
         logger.info(f"Evaluation metrics: {metrics}")
+        
+        # Evaluate on test set if using custom splits
+        if args.use_custom_splits:
+            logger.info("\nEvaluating on test set...")
+            test_metrics = trainer.evaluate(eval_dataset=test_dataset)
+            logger.info(f"Test metrics: {test_metrics}")
+        
         return
     
     # Regular training path
@@ -583,6 +652,12 @@ def main():
     logger.info("Running final evaluation...")
     final_metrics = trainer.evaluate()
     logger.info(f"Final evaluation metrics: {final_metrics}")
+    
+    # Evaluate on test set if using custom splits
+    if args.use_custom_splits:
+        logger.info("\nEvaluating on test set...")
+        test_metrics = trainer.evaluate(eval_dataset=test_dataset)
+        logger.info(f"Test metrics: {test_metrics}")
 
 if __name__ == "__main__":
     main()
