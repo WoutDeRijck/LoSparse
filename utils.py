@@ -201,7 +201,7 @@ def substitute_layer_weights(module,
                              do_svd=True,
                              device=None,
                              batch_size=10,
-                             verbose=True,
+                             verbose=False,
                              **kwargs):
     """
     :param          do_svd: operate SVD
@@ -225,9 +225,6 @@ def substitute_layer_weights(module,
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    if verbose:
-        print(f"Running substitute_layer_weights on device: {device}")
-        
     # First pass: identify eligible linear layers for replacement
     eligible_layers = []
     
@@ -236,19 +233,14 @@ def substitute_layer_weights(module,
         if type(target_attr) == nn.Linear and any(an in attr_str for an in allow_name):
             eligible_layers.append((attr_str, target_attr))
     
-    if verbose and eligible_layers:
-        print(f"Found {len(eligible_layers)} eligible layers for replacement")
-        
     # Process eligible layers in batches
     for i in range(0, len(eligible_layers), batch_size):
         batch = eligible_layers[i:i+batch_size]
-        if verbose:
-            print(f"Processing batch {i//batch_size + 1}/{(len(eligible_layers) + batch_size - 1)//batch_size}: {len(batch)} layers")
         
         # Process batch
         for j, (attr_str, target_attr) in enumerate(batch):
-            if verbose:
-                print(f"Processing layer {i+j+1}/{len(eligible_layers)}: {attr_str}")
+            print("====================================================")
+            print(attr_str, target_attr)
                 
             if do_svd:
                 # Decompose a matrix by SVD (compute on specified device)
@@ -256,12 +248,11 @@ def substitute_layer_weights(module,
                                             device=device, return_dict=True, **kwargs)
                 L, R, reduced_rank = output['L'], output['R'], output['reduced_rank']
                 S = target_attr.weight - torch.mm(L, R)
-                if verbose:
-                    print(f"Layer {attr_str}: Reduced rank: {reduced_rank}")
+                print(f"Reduced rank: {reduced_rank}")
 
                 # Create a nn.Module and assign decomposed weights to the parameters
                 linear_loras = LinearLoSparse(target_attr.in_features, target_attr.out_features, reduced_rank,
-                                        has_bias=True, has_sparse=has_sparse)
+                                         has_bias=True, has_sparse=has_sparse)
                 linear_loras.initialize_weight(L, R, S, target_attr.bias)
 
             else:
@@ -273,7 +264,7 @@ def substitute_layer_weights(module,
 
                 # Create a nn.Module and assign decomposed weights to the parameters
                 linear_loras = LinearLoSparse(target_attr.in_features, target_attr.out_features, reduced_rank,
-                                        has_bias=True, has_sparse=has_sparse)
+                                         has_bias=True, has_sparse=has_sparse)
 
                 linear_loras.initialize_weight(L, R, S, target_attr.bias)
 
@@ -332,9 +323,10 @@ class Pruner(object):
         
         # Initialize importance maps on appropriate device
         for n, p in self.prunable_params.items():
-            self.exp_avg_ipt[n] = torch.zeros_like(p, device=self.device)
-            if self.beta2 > 0 and self.beta2 != 1:
-                self.exp_avg_unc[n] = torch.zeros_like(p, device=self.device)
+            if n not in self.exp_avg_ipt:
+                self.exp_avg_ipt[n] = torch.zeros_like(p, device=self.device)
+                if self.beta2 > 0 and self.beta2 != 1:
+                    self.exp_avg_unc[n] = torch.zeros_like(p, device=self.device)
 
     def whether_mask_para(self, n):
         if not self.use_no_mask:

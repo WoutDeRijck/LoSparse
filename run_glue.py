@@ -211,8 +211,7 @@ def main():
             parameter_ratio=args.low_rank_parameter_ratio,
             do_svd=True,
             device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-            batch_size=5,  # Process 5 layers at once
-            verbose=True   # Show progress
+            batch_size=5  # Process 5 layers at once
         )
 
     model.resize_token_embeddings(len(tokenizer))
