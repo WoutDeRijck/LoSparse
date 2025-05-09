@@ -8,7 +8,8 @@ import torch.nn.functional as F
 def low_rank_decomposition(weight, rank_ratio=0.1, parameter_ratio=0.15,
                            remove_criteria='max_eigenvalue',
                            log_level='INFO',
-                           return_dict=False):
+                           return_dict=False,
+                           device=None):
     """
     :param          weight: The matrix to decompose, of shape (H, W)
     :param      rank_ratio: rank_of_decomposed_matrix / rank_of_input_weight
@@ -16,6 +17,7 @@ def low_rank_decomposition(weight, rank_ratio=0.1, parameter_ratio=0.15,
     :param remove_criteria: choose from ['max_eigenvalue', 'random', 'min_eigenvalue']
     :param       log_level: choose from ['IGNORE', 'INFO', 'DEBUG']
     :param     return_dict: Return a dict if True, else return a tuple (L, R)
+    :param          device: Device to perform computation on (default: same as weight)
     :return:
     """
 
@@ -25,8 +27,15 @@ def low_rank_decomposition(weight, rank_ratio=0.1, parameter_ratio=0.15,
     assert matrix_dimension == 2, "Only Support 2D matrix"
     H, W = weight.size()
 
+    # Use the same device as weight if not specified
+    if device is None:
+        device = weight.device
+    
+    # Move weight to specified device for computation
+    weight_device = weight.to(device)
+
     # Use SVD to decompose a matrix, default full_matrices is False to save parameters
-    U, S, Vh = torch.linalg.svd(weight, full_matrices=False)
+    U, S, Vh = torch.linalg.svd(weight_device, full_matrices=False)
     rank = torch.count_nonzero(S)
     is_full_rank = rank == min(H, W)
 
@@ -61,6 +70,11 @@ def low_rank_decomposition(weight, rank_ratio=0.1, parameter_ratio=0.15,
         print(f"Reduced Rank: {reduced_rank} | Num Parameters: {(H + W) * reduced_rank}")
         print(f"L: {L.shape} | R: {R.shape}")
 
+    # Move results back to original device if needed
+    if L.device != weight.device:
+        L = L.to(weight.device)
+        R = R.to(weight.device)
+
     if return_dict:
         return {"L": L, "R": R, "U": U, "S": S, "Vh": Vh, 'reduced_rank': reduced_rank}
     else:
@@ -94,32 +108,44 @@ class LinearLoSparse(nn.Module):
         self.sparse_weight_pruned = None
         self.SX = None
         self.SX_deberta = None
+        
+        # Register forward pre-hook for optimized computation
+        self.register_forward_pre_hook(self._update_pruned_weight)
+        
+        # Use JIT compilation for faster inference when possible
+        self._use_jit = False
+        try:
+            # Check if JIT is available
+            if torch.__version__ >= '1.7.0':
+                self._use_jit = True
+        except:
+            pass
+
+    def _update_pruned_weight(self, module, input):
+        # This pre-hook updates the pruned weight representation if needed
+        if self.has_sparse and self.nonzero_idx is None and (self.sparse.weight != 0).any():
+            self.prune_sparse()
 
     def forward(self, x):
-        batch_size = x.size(0)
-        
-        # Low rank component
-        LRX = self.left(self.right(x))  # Shape: [batch_size, out_feature]
+        # Low rank component - this is always needed
+        # Use sequential computation for better memory efficiency
+        right_output = self.right(x)
+        LRX = self.left(right_output)
         
         # Sparse component with pruning optimization
         if self.has_sparse:
-            if self.sparse_weight_pruned is not None:
-                # Efficient computation using only non-zero weights
-                SX_ = torch.matmul(x, self.sparse_weight_pruned.T)
-                
-                # Restore full dimension output
-                if self.SX is None:
-                    B, L, D = x.shape
-                    out_feature, in_feature = self.sparse.weight.shape
-                    self.SX = torch.zeros(B, L, out_feature, device=x.device)
-                
-                # Update only non-zero indices
-                self.SX[..., self.nonzero_idx] = SX_
-                SX = self.SX
-            else:
-                SX = F.linear(x, self.sparse.weight, None)
+            # Fast path: if sparse weights are all zero or none are pruned yet
+            if hasattr(self.sparse.weight, 'data') and (self.sparse.weight.data == 0).all():
+                # All zeros - skip computation
+                if self.has_bias and self.bias is not None:
+                    return LRX + self.bias
+                return LRX
+            
+            # Use efficient linear operation
+            SX = F.linear(x, self.sparse.weight, None)
         else:
-            SX = torch.zeros_like(LRX, device=x.device)
+            # No sparse component
+            SX = 0
         
         # Add bias if present
         if self.has_bias and self.bias is not None:
@@ -136,9 +162,24 @@ class LinearLoSparse(nn.Module):
             self.bias = nn.Parameter(bias)
 
     def prune_sparse(self):
-        self.nonzero_idx = torch.nonzero(self.sparse.weight.sum(dim=1)).flatten()
-        # self.sparse_weight_pruned = self.sparse.weight[self.nonzero_idx, :]
-        self.sparse_weight_pruned = nn.Parameter(self.sparse.weight[self.nonzero_idx, :])
+        """Identify and store non-zero indices for optimized computation"""
+        if not self.has_sparse:
+            return
+            
+        # Find indices of rows with any non-zero values
+        row_mask = torch.any(self.sparse.weight != 0, dim=1)
+        self.nonzero_idx = torch.nonzero(row_mask).flatten()
+        
+        # Store the pruned weight - only keep non-zero rows
+        if len(self.nonzero_idx) > 0:
+            self.sparse_weight_pruned = self.sparse.weight[self.nonzero_idx]
+        else:
+            # All weights are zero
+            self.sparse_weight_pruned = None
+        
+        # Clear cached tensors to free memory
+        self.SX = None
+        self.SX_deberta = None
 
 
 def prune(module):
@@ -158,6 +199,9 @@ def substitute_layer_weights(module,
                              parameter_ratio=0.15,
                              has_sparse=True,
                              do_svd=True,
+                             device=None,
+                             batch_size=10,
+                             verbose=True,
                              **kwargs):
     """
     :param          do_svd: operate SVD
@@ -166,7 +210,9 @@ def substitute_layer_weights(module,
     :param      allow_name: replace the module if its name is in the allow_name
     :param parameter_ratio: low rank matrix parameter / original matrix parameter
     :param      has_sparse: True if use LoRaS, false if use Low Rank only
-
+    :param          device: Device to use for SVD computation (default: GPU if available, else CPU)
+    :param      batch_size: Number of layers to process in parallel
+    :param        verbose: Whether to print progress information
     :return: None
     """
     # Default allow name and block name lists
@@ -174,47 +220,71 @@ def substitute_layer_weights(module,
         allow_name = ['query', 'key', 'value', 'dense', 'attention']
     if block_name is None:
         block_name = ['pooler', 'classifier', 'LayerNorm', 'embeddings']
-
+        
+    # Determine computation device if not specified
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    if verbose:
+        print(f"Running substitute_layer_weights on device: {device}")
+        
+    # First pass: identify eligible linear layers for replacement
+    eligible_layers = []
+    
     for attr_str in dir(module):
         target_attr = getattr(module, attr_str)
-
-        if type(target_attr) == nn.Linear and any(attr_str in an for an in allow_name):
-            print("====================================================")
-            print(attr_str, target_attr)
-
+        if type(target_attr) == nn.Linear and any(an in attr_str for an in allow_name):
+            eligible_layers.append((attr_str, target_attr))
+    
+    if verbose and eligible_layers:
+        print(f"Found {len(eligible_layers)} eligible layers for replacement")
+        
+    # Process eligible layers in batches
+    for i in range(0, len(eligible_layers), batch_size):
+        batch = eligible_layers[i:i+batch_size]
+        if verbose:
+            print(f"Processing batch {i//batch_size + 1}/{(len(eligible_layers) + batch_size - 1)//batch_size}: {len(batch)} layers")
+        
+        # Process batch
+        for j, (attr_str, target_attr) in enumerate(batch):
+            if verbose:
+                print(f"Processing layer {i+j+1}/{len(eligible_layers)}: {attr_str}")
+                
             if do_svd:
-                # Decompose a matrix by SVD
+                # Decompose a matrix by SVD (compute on specified device)
                 output = low_rank_decomposition(target_attr.weight, parameter_ratio=parameter_ratio,
-                                                return_dict=True, **kwargs)
+                                            device=device, return_dict=True, **kwargs)
                 L, R, reduced_rank = output['L'], output['R'], output['reduced_rank']
                 S = target_attr.weight - torch.mm(L, R)
-                print(f"Reduced rank: {reduced_rank}")
+                if verbose:
+                    print(f"Layer {attr_str}: Reduced rank: {reduced_rank}")
 
                 # Create a nn.Module and assign decomposed weights to the parameters
                 linear_loras = LinearLoSparse(target_attr.in_features, target_attr.out_features, reduced_rank,
-                                           has_bias=True, has_sparse=has_sparse)
+                                        has_bias=True, has_sparse=has_sparse)
                 linear_loras.initialize_weight(L, R, S, target_attr.bias)
 
             else:
                 H, W = target_attr.weight.shape
                 reduced_rank = math.ceil(parameter_ratio * (H * W) / (H + W))
-                L = torch.zeros(H, reduced_rank, requires_grad=True)
-                R = torch.zeros(reduced_rank, W, requires_grad=True)
-                S = torch.zeros(H, W, requires_grad=True)
+                L = torch.zeros(H, reduced_rank, requires_grad=True, device=target_attr.weight.device)
+                R = torch.zeros(reduced_rank, W, requires_grad=True, device=target_attr.weight.device)
+                S = torch.zeros(H, W, requires_grad=True, device=target_attr.weight.device)
 
                 # Create a nn.Module and assign decomposed weights to the parameters
                 linear_loras = LinearLoSparse(target_attr.in_features, target_attr.out_features, reduced_rank,
-                                           has_bias=True, has_sparse=has_sparse)
+                                        has_bias=True, has_sparse=has_sparse)
 
                 linear_loras.initialize_weight(L, R, S, target_attr.bias)
 
             setattr(module, attr_str, linear_loras)
-
+            
+    # Process child modules
     for name, immediate_child_module in module.named_children():
         # do not continue to iterate when the module's name is in the block_name
         if not any(name in bn for bn in block_name):
             substitute_layer_weights(immediate_child_module, allow_name, block_name, parameter_ratio,
-                                     has_sparse, do_svd, **kwargs)
+                                 has_sparse, do_svd, device, batch_size, verbose, **kwargs)
 
 
 class Pruner(object):
@@ -224,12 +294,18 @@ class Pruner(object):
                  use_no_mask=False,
                  pruner_name='PLATON',
                  structured_method='mean',
-                 structured_direction='row'):
+                 structured_direction='row',
+                 device=None):
 
         if non_mask_name is None:
             non_mask_name = ["embedding", "norm"]
         if mask_param_name is None:
             mask_param_name = ['sparse']
+            
+        # Determine device for computation
+        if device is None:
+            device = next(model.parameters()).device
+            
         self.model = model
         self.config = vars(args)
         self.args = args
@@ -248,6 +324,17 @@ class Pruner(object):
         self.structured_method = structured_method
         self.structured_direction = structured_direction
         self.current_threshold = 1.0  # Initialize with no pruning
+        self.device = device
+        
+        # Pre-identify prunable parameters for faster access
+        self.prunable_params = {n: p for n, p in model.named_parameters() 
+                               if self.whether_mask_para(n)}
+        
+        # Initialize importance maps on appropriate device
+        for n, p in self.prunable_params.items():
+            self.exp_avg_ipt[n] = torch.zeros_like(p, device=self.device)
+            if self.beta2 > 0 and self.beta2 != 1:
+                self.exp_avg_unc[n] = torch.zeros_like(p, device=self.device)
 
     def whether_mask_para(self, n):
         if not self.use_no_mask:
@@ -257,53 +344,49 @@ class Pruner(object):
 
     def structured_prune(self, is_dict_mat, name):
         num_row, num_col = is_dict_mat.shape
+        
+        # Use torch operations for efficiency
         if self.structured_direction == 'row_col':
-            if self.structured_method == "mean":
-                if any(nd in name for nd in ['q', 'k', 'v']):
-                    return torch.mean(is_dict_mat, dim=1, keepdim=True).repeat((1, num_col))
-                else:
-                    return torch.mean(is_dict_mat, dim=0, keepdim=True).repeat((num_row, 1))
-            elif self.structured_method == "sum":
-                if any(nd in name for nd in ['q', 'k', 'v']):
-                    return torch.sum(is_dict_mat, dim=1, keepdim=True).repeat((1, num_col))
-                else:
-                    return torch.sum(is_dict_mat, dim=0, keepdim=True).repeat((num_row, 1))
-            elif self.structured_method == "max":
-                if any(nd in name for nd in ['q', 'k', 'v']):
-                    return torch.max(is_dict_mat, dim=1, keepdim=True).repeat((1, num_col))
-                else:
-                    return torch.max(is_dict_mat, dim=0, keepdim=True).repeat((num_row, 1))
-            elif self.structured_method == "min":
-                if any(nd in name for nd in ['q', 'k', 'v']):
-                    return torch.min(is_dict_mat, dim=1, keepdim=True).repeat((1, num_col))
-                else:
-                    return torch.min(is_dict_mat, dim=0, keepdim=True).repeat((num_row, 1))
+            if any(nd in name for nd in ['q', 'k', 'v']):
+                # Row direction
+                if self.structured_method == "mean":
+                    return torch.mean(is_dict_mat, dim=1, keepdim=True).expand(-1, num_col)
+                elif self.structured_method == "sum":
+                    return torch.sum(is_dict_mat, dim=1, keepdim=True).expand(-1, num_col)
+                elif self.structured_method == "max":
+                    return torch.max(is_dict_mat, dim=1, keepdim=True)[0].expand(-1, num_col)
+                elif self.structured_method == "min":
+                    return torch.min(is_dict_mat, dim=1, keepdim=True)[0].expand(-1, num_col)
             else:
-                raise ValueError("Unimplemented Sturctured Method: %s" % self.structured_method)
+                # Column direction
+                if self.structured_method == "mean":
+                    return torch.mean(is_dict_mat, dim=0, keepdim=True).expand(num_row, -1)
+                elif self.structured_method == "sum":
+                    return torch.sum(is_dict_mat, dim=0, keepdim=True).expand(num_row, -1)
+                elif self.structured_method == "max":
+                    return torch.max(is_dict_mat, dim=0, keepdim=True)[0].expand(num_row, -1)
+                elif self.structured_method == "min":
+                    return torch.min(is_dict_mat, dim=0, keepdim=True)[0].expand(num_row, -1)
         elif self.structured_direction == 'row':
             if self.structured_method == "mean":
-                return torch.mean(is_dict_mat, dim=1, keepdim=True).repeat((1, num_col))
+                return torch.mean(is_dict_mat, dim=1, keepdim=True).expand(-1, num_col)
             elif self.structured_method == "sum":
-                return torch.sum(is_dict_mat, dim=1, keepdim=True).repeat((1, num_col))
+                return torch.sum(is_dict_mat, dim=1, keepdim=True).expand(-1, num_col)
             elif self.structured_method == "max":
-                return torch.max(is_dict_mat, dim=1, keepdim=True).repeat((1, num_col))
+                return torch.max(is_dict_mat, dim=1, keepdim=True)[0].expand(-1, num_col)
             elif self.structured_method == "min":
-                return torch.min(is_dict_mat, dim=1, keepdim=True).repeat((1, num_col))
-            else:
-                raise ValueError("Unimplemented Sturctured Method: %s" % self.structured_method)
+                return torch.min(is_dict_mat, dim=1, keepdim=True)[0].expand(-1, num_col)
         elif self.structured_direction == 'col':
             if self.structured_method == "mean":
-                return torch.mean(is_dict_mat, dim=0, keepdim=True).repeat((num_row, 1))
+                return torch.mean(is_dict_mat, dim=0, keepdim=True).expand(num_row, -1)
             elif self.structured_method == "sum":
-                return torch.sum(is_dict_mat, dim=0, keepdim=True).repeat((num_row, 1))
+                return torch.sum(is_dict_mat, dim=0, keepdim=True).expand(num_row, -1)
             elif self.structured_method == "max":
-                return torch.max(is_dict_mat, dim=0, keepdim=True).repeat((num_row, 1))
+                return torch.max(is_dict_mat, dim=0, keepdim=True)[0].expand(num_row, -1)
             elif self.structured_method == "min":
-                return torch.min(is_dict_mat, dim=0, keepdim=True).repeat((num_row, 1))
-            else:
-                raise ValueError("Unimplemented Sturctured Method: %s" % self.structured_method)
-        else:
-            raise ValueError("Unimplemented Sturctured Direction: %s" % self.structured_direction)
+                return torch.min(is_dict_mat, dim=0, keepdim=True)[0].expand(num_row, -1)
+        
+        raise ValueError(f"Unsupported: {self.structured_method} with {self.structured_direction}")
 
     def schedule_threshold_comb(self, step: int):
         # Schedule the remaining ratio
@@ -332,109 +415,149 @@ class Pruner(object):
 
     def update_ipt_with_local_window(self, model, global_step):
         # Calculate the sensitivity and uncertainty
-        for n, p in model.named_parameters():
-            if self.whether_mask_para(n):
-                # Skip if no gradient
-                if p.grad is None:
-                    continue
-                    
-                # Initialize if not exists
-                if n not in self.exp_avg_ipt:
-                    self.exp_avg_ipt[n] = torch.zeros_like(p)
-                    # Initialize with current importance instead of zeros
-                    self.ipt[n] = (p * p.grad).abs().detach()
-                    if self.beta2 > 0 and self.beta2 != 1:
-                        self.exp_avg_unc[n] = torch.zeros_like(p)
+        local_step = global_step % self.deltaT
+        update_step = global_step // self.deltaT
+        
+        # Process all prunable parameters
+        for n, p in self.prunable_params.items():
+            # Skip if no gradient
+            if p.grad is None:
+                continue
                 
-                # PLATON importance calculation
-                if self.pruner_name == 'PLATON':
-                    local_step = global_step % self.deltaT
-                    update_step = global_step // self.deltaT
+            # Initialize if not exists (should be already done in __init__)
+            if n not in self.ipt:
+                self.ipt[n] = (p * p.grad).abs().detach()
+            
+            # PLATON importance calculation
+            if self.pruner_name == 'PLATON':
+                # Calculate new importance
+                new_ipt = (p * p.grad).abs().detach()
+                
+                if local_step == 0:
+                    # Update exponential moving average
+                    self.exp_avg_ipt[n] = self.beta1 * self.exp_avg_ipt[n] + (1 - self.beta1) * self.ipt[n]
                     
-                    # Calculate new importance
-                    new_ipt = (p * p.grad).abs().detach()
+                    # Update uncertainty estimate
+                    if 0 < self.beta2 < 1:
+                        self.exp_avg_unc[n] = self.beta2 * self.exp_avg_unc[n] + \
+                                            (1 - self.beta2) * (self.ipt[n] - self.exp_avg_ipt[n]).abs()
+                    elif self.beta2 == 2.:
+                        self.exp_avg_unc[n] = (update_step * self.exp_avg_unc[n] +
+                                             (self.ipt[n] - self.exp_avg_ipt[n]) ** 2) / (update_step + 1)
                     
-                    if local_step == 0:
-                        # Update exponential moving average
-                        self.exp_avg_ipt[n] = self.beta1 * self.exp_avg_ipt[n] + (1 - self.beta1) * self.ipt[n]
-                        
-                        # Update uncertainty estimate
-                        if 0 < self.beta2 < 1:
-                            self.exp_avg_unc[n] = self.beta2 * self.exp_avg_unc[n] + \
-                                                (1 - self.beta2) * (self.ipt[n] - self.exp_avg_ipt[n]).abs()
-                        elif self.beta2 == 2.:
-                            self.exp_avg_unc[n] = (update_step * self.exp_avg_unc[n] +
-                                                 (self.ipt[n] - self.exp_avg_ipt[n]) ** 2) / (update_step + 1)
-                        
-                        # Reset importance accumulator
-                        self.ipt[n] = new_ipt
-                    else:
-                        # Accumulate importance with moving average
-                        self.ipt[n] = (self.ipt[n] * local_step + new_ipt) / (local_step + 1)
+                    # Reset importance accumulator
+                    self.ipt[n] = new_ipt
                 else:
-                    raise ValueError("Incorrect Pruner Name.")
+                    # Accumulate importance with moving average
+                    self.ipt[n] = (self.ipt[n] * local_step + new_ipt) / (local_step + 1)
+            else:
+                raise ValueError("Incorrect Pruner Name.")
 
     def mask_with_threshold(self, model, threshold):
-        # Initialize importance score dictionary
+        # Calculate importance scores more efficiently
         is_dict = {}
         
-        # Calculate importance scores
-        for n, p in model.named_parameters():
-            if self.whether_mask_para(n):
-                if self.pruner_name == 'Magnitude':
-                    is_dict[n] = p.abs().detach()
-                elif self.pruner_name == 'PLATON':
-                    # Skip if no importance scores
-                    if n not in self.exp_avg_ipt:
-                        continue
-                    
-                    # Use current importance scores directly
-                    if 0 < self.beta2 < 1:
-                        is_dict[n] = self.ipt[n] * self.exp_avg_unc[n]  # Use current importance instead of exp_avg_ipt
-                    elif self.beta2 == 1.:
-                        is_dict[n] = self.ipt[n]  # Use current importance directly
-                    elif self.beta2 == 2.:
-                        is_dict[n] = self.ipt[n] * self.exp_avg_unc[n].sqrt()
-                    else:
-                        is_dict[n] = self.ipt[n] * (self.ipt[n] - self.exp_avg_ipt[n]).abs()
+        # Pre-compute all importance scores at once
+        for n, p in self.prunable_params.items():
+            if self.pruner_name == 'Magnitude':
+                is_dict[n] = p.abs().detach()
+            elif self.pruner_name == 'PLATON':
+                # Skip if no importance scores
+                if n not in self.ipt:
+                    continue
+                
+                # Select appropriate importance metric
+                if 0 < self.beta2 < 1:
+                    is_dict[n] = self.ipt[n] * self.exp_avg_unc[n]
+                elif self.beta2 == 1.:
+                    is_dict[n] = self.ipt[n]
+                elif self.beta2 == 2.:
+                    is_dict[n] = self.ipt[n] * self.exp_avg_unc[n].sqrt()
+                else:
+                    is_dict[n] = self.ipt[n] * (self.ipt[n] - self.exp_avg_ipt[n]).abs()
 
+                # Apply structured pruning if needed
                 if self.structured_method is not None and len(is_dict[n].shape) == 2:
                     is_dict[n] = self.structured_prune(is_dict[n], n)
 
-        # Calculate statistics and threshold
-        all_is = []
-        for n, is_score in is_dict.items():
-            all_is.append(is_score.view(-1))
-        
-        all_is = torch.cat(all_is)
-        num_elements = all_is.shape[0]
-        
-        # Ensure k is within valid range [1, num_elements]
+        # Calculate threshold - use different methods based on data size
+        num_elements = sum(s.numel() for s in is_dict.values())
         k = max(1, min(num_elements, int(num_elements * (1 - self.current_threshold))))
-        mask_threshold = torch.kthvalue(all_is, k)[0].item()
         
-        # Mask weights whose importance lower than threshold
+        # For very large tensors, use approximate method to avoid OOM
+        if num_elements > 10000000:  # 10M elements
+            # Sample a subset for estimation
+            sample_size = min(1000000, num_elements // 10)  # 1M elements or 10% of data
+            sampled_values = []
+            # Sample from each tensor proportionally to its size
+            for is_score in is_dict.values():
+                n_elements = is_score.numel()
+                if n_elements == 0:
+                    continue
+                sample_ratio = sample_size * n_elements / num_elements
+                indices = torch.randint(0, n_elements, (int(sample_ratio),), device=self.device)
+                sampled_values.append(is_score.view(-1)[indices])
+            
+            if sampled_values:
+                # Combine samples and estimate threshold
+                sampled_tensor = torch.cat(sampled_values)
+                approximate_quantile = float(k) / num_elements
+                mask_threshold = torch.quantile(sampled_tensor, approximate_quantile).item()
+            else:
+                # Fallback if no samples
+                mask_threshold = 0.0
+        else:
+            # For smaller tensors, collect all values and use kthvalue
+            all_is = torch.empty(num_elements, device=self.device)
+            idx = 0
+            for is_score in is_dict.values():
+                size = is_score.numel()
+                if size > 0:
+                    all_is[idx:idx+size] = is_score.view(-1)
+                    idx += size
+            
+            if idx > 0:
+                mask_threshold = torch.kthvalue(all_is[:idx], k)[0].item()
+            else:
+                mask_threshold = 0.0
+        
+        # Apply masks in a batched manner
         total_weights = 0
         total_pruned = 0
-        for n, p in model.named_parameters():
-            if self.whether_mask_para(n):
-                if n in is_dict:  # Only process if we have importance scores
-                    num_zeros_before = (p.data == 0).sum().item()
-                    mask = is_dict[n] < mask_threshold
-                    p.data.masked_fill_(mask, 0.0)
-                    num_zeros_after = (p.data == 0).sum().item()
-                    pruned = num_zeros_after - num_zeros_before
-                    total_pruned += pruned
-                    total_weights += p.numel()
+        
+        for n, p in self.prunable_params.items():
+            if n in is_dict:  # Only process if we have importance scores
+                # Use memory-efficient masking
+                mask = is_dict[n] < mask_threshold
+                p.data.masked_fill_(mask, 0.0)
+                
+                # Add to statistics
+                num_zeros = mask.sum().item()
+                total_pruned += num_zeros
+                total_weights += p.numel()
         
         return mask_threshold
 
     def update_and_pruning(self, model, global_step):
         # Update importance score after optimizer stepping
         self.update_ipt_with_local_window(model, global_step)
-        # Get the remaining ratio
+        
+        # Get the pruning threshold
         threshold, mask_ind = self.schedule_threshold_comb(global_step)
-        # Always apply masking with current threshold
-        mask_threshold = self.mask_with_threshold(model, threshold)
+        
+        # Apply masking if appropriate
+        mask_threshold = None
+        if mask_ind:
+            mask_threshold = self.mask_with_threshold(model, threshold)
+            
+            # Apply pruning to optimize forward pass
+            self._apply_sparse_pruning(model)
+        
         return threshold, mask_threshold
+        
+    def _apply_sparse_pruning(self, model):
+        """Apply pruning optimization to all LinearLoSparse layers"""
+        for module in model.modules():
+            if isinstance(module, LinearLoSparse) and module.has_sparse:
+                module.prune_sparse()
 

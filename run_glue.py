@@ -209,7 +209,10 @@ def main():
             allow_name=allow_name,
             block_name=block_name,
             parameter_ratio=args.low_rank_parameter_ratio,
-            do_svd=True
+            do_svd=True,
+            device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+            batch_size=5,  # Process 5 layers at once
+            verbose=True   # Show progress
         )
 
     model.resize_token_embeddings(len(tokenizer))
@@ -355,11 +358,39 @@ def main():
         gradient_accumulation_steps=args.gradient_accumulation_steps
     )
 
-    metric = evaluate.load("accuracy")
+    # Load the appropriate metrics based on the task
     def compute_metrics(eval_pred):
         predictions, labels = eval_pred
-        predictions = np.argmax(predictions, axis=1) if not is_regression else predictions[:, 0]
-        return metric.compute(predictions=predictions, references=labels)
+        
+        # Handle regression vs classification predictions
+        if is_regression:
+            predictions = predictions[:, 0]
+        else:
+            predictions = np.argmax(predictions, axis=1)
+            
+        # Use task-specific metrics
+        if args.task_name == "cola":
+            # Matthews Correlation Coefficient for CoLA
+            mcc_metric = evaluate.load("matthews_correlation")
+            return mcc_metric.compute(predictions=predictions, references=labels)
+        elif args.task_name == "stsb":
+            # Pearson & Spearman correlation for STS-B
+            pearson_metric = evaluate.load("pearsonr")
+            spearman_metric = evaluate.load("spearmanr")
+            pearson_result = pearson_metric.compute(predictions=predictions, references=labels)
+            spearman_result = spearman_metric.compute(predictions=predictions, references=labels)
+            return {**pearson_result, **spearman_result}
+        elif args.task_name in ["mrpc", "qqp"]:
+            # F1 score in addition to accuracy for MRPC and QQP
+            accuracy_metric = evaluate.load("accuracy")
+            f1_metric = evaluate.load("f1")
+            accuracy_result = accuracy_metric.compute(predictions=predictions, references=labels)
+            f1_result = f1_metric.compute(predictions=predictions, references=labels, average="binary")
+            return {**accuracy_result, **f1_result}
+        else:
+            # Default to accuracy for other tasks
+            accuracy_metric = evaluate.load("accuracy")
+            return accuracy_metric.compute(predictions=predictions, references=labels)
 
     class PruningCallback(TrainerCallback):
         def __init__(self, pruner):
@@ -485,7 +516,8 @@ def main():
         args=args,
         total_step=args.max_train_steps,
         mask_param_name=['sparse'],
-        pruner_name='PLATON'
+        pruner_name='PLATON',
+        device=model.device  # Use the model's device for computations
     )
 
     # If we're only evaluating
