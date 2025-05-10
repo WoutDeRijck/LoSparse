@@ -418,12 +418,12 @@ class Pruner(object):
                 
             # Initialize if not exists (should be already done in __init__)
             if n not in self.ipt:
-                self.ipt[n] = (p * p.grad).abs().detach()
+                self.ipt[n] = (p * p.grad).abs().detach().to(self.device)
             
             # PLATON importance calculation
             if self.pruner_name == 'PLATON':
                 # Calculate new importance
-                new_ipt = (p * p.grad).abs().detach()
+                new_ipt = (p * p.grad).abs().detach().to(self.device)
                 
                 if local_step == 0:
                     # Update exponential moving average
@@ -452,7 +452,7 @@ class Pruner(object):
         # Pre-compute all importance scores at once
         for n, p in self.prunable_params.items():
             if self.pruner_name == 'Magnitude':
-                is_dict[n] = p.abs().detach()
+                is_dict[n] = p.abs().detach().to(self.device)
             elif self.pruner_name == 'PLATON':
                 # Skip if no importance scores
                 if n not in self.ipt:
@@ -460,13 +460,13 @@ class Pruner(object):
                 
                 # Select appropriate importance metric
                 if 0 < self.beta2 < 1:
-                    is_dict[n] = self.ipt[n] * self.exp_avg_unc[n]
+                    is_dict[n] = (self.ipt[n] * self.exp_avg_unc[n]).to(self.device)
                 elif self.beta2 == 1.:
-                    is_dict[n] = self.ipt[n]
+                    is_dict[n] = self.ipt[n].to(self.device)
                 elif self.beta2 == 2.:
-                    is_dict[n] = self.ipt[n] * self.exp_avg_unc[n].sqrt()
+                    is_dict[n] = (self.ipt[n] * self.exp_avg_unc[n].sqrt()).to(self.device)
                 else:
-                    is_dict[n] = self.ipt[n] * (self.ipt[n] - self.exp_avg_ipt[n]).abs()
+                    is_dict[n] = (self.ipt[n] * (self.ipt[n] - self.exp_avg_ipt[n]).abs()).to(self.device)
 
                 # Apply structured pruning if needed
                 if self.structured_method is not None and len(is_dict[n].shape) == 2:
@@ -521,7 +521,7 @@ class Pruner(object):
             if n in is_dict:  # Only process if we have importance scores
                 # Use memory-efficient masking
                 mask = is_dict[n] < mask_threshold
-                p.data.masked_fill_(mask, 0.0)
+                p.data.masked_fill_(mask.to(p.device), 0.0)
                 
                 # Add to statistics
                 num_zeros = mask.sum().item()
