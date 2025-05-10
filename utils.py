@@ -488,7 +488,8 @@ class Pruner(object):
                     continue
                 sample_ratio = sample_size * n_elements / num_elements
                 indices = torch.randint(0, n_elements, (int(sample_ratio),), device=self.device)
-                sampled_values.append(is_score.view(-1)[indices])
+                # Use reshape instead of view and ensure tensor is contiguous
+                sampled_values.append(is_score.contiguous().reshape(-1)[indices])
             
             if sampled_values:
                 # Combine samples and estimate threshold
@@ -505,7 +506,8 @@ class Pruner(object):
             for is_score in is_dict.values():
                 size = is_score.numel()
                 if size > 0:
-                    all_is[idx:idx+size] = is_score.view(-1)
+                    # Use reshape instead of view and ensure tensor is contiguous
+                    all_is[idx:idx+size] = is_score.contiguous().reshape(-1)
                     idx += size
             
             if idx > 0:
